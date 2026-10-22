@@ -1,0 +1,8 @@
+load("@rules_shell//shell:sh_library.bzl", "sh_library")
+
+# Nothing depends on this: it is how the scripts, which only people and
+# workflows run, are seen by the shellcheck aspect (--config=lint).
+sh_library(
+    name = "scripts",
+    srcs = glob(["*.sh"]),
+)

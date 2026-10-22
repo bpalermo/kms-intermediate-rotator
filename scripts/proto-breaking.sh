@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Fail if the protos in this checkout break the configuration contract of an
+# earlier commit: a field renamed, retyped or deleted, so that a configuration
+# that worked there no longer parses. The rules are `breaking` in buf.yaml.
+#
+# Both sides are compiled by Bazel, each from its own tree, and compared by
+# the buf that MODULE.bazel pins; buf compiles nothing. The earlier commit is
+# checked out into a git worktree outside this one, always at the same path so
+# that its Bazel output base is reused.
+#
+# Usage:
+#   proto-breaking.sh [<ref>] [<bazel flag>...]
+#
+# <ref> is what to compare against, by default origin/main. The comparison is
+# with the commit this checkout branched from it, so a branch behind <ref> is
+# not blamed for what <ref> has gained since.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+ref="origin/main"
+if [[ $# -gt 0 && "$1" != -* ]]; then
+	ref="$1"
+	shift
+fi
+base="$(git merge-base HEAD "${ref}")"
+
+# In the target configuration only: after a build, cquery also answers with
+# the configurations other rules built the same protos in, and each file would
+# be in the image once per configuration.
+protos="config(kind(proto_library, deps(//config/v1:configv1_proto)), target)"
+
+# image <tree> <output> [<bazel flag>...] writes the descriptors of the protos
+# and of everything they import, as one FileDescriptorSet: buf resolves the
+# imports from its input.
+image() {
+	local tree="$1" output="$2"
+	shift 2
+	(
+		cd "${tree}"
+		local targets
+		mapfile -t targets < <(bazel cquery "$@" "${protos}" --output=label 2>/dev/null | cut -d' ' -f1)
+		bazel build "$@" -- "${targets[@]}"
+		# A serialized message with one repeated field: concatenating merges.
+		bazel cquery "$@" "${protos}" --output=files 2>/dev/null | xargs cat >"${output}"
+	)
+	[[ -s "${output}" ]] || {
+		echo "proto-breaking: no descriptors were built in ${tree}" >&2
+		exit 2
+	}
+}
+
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+
+baseline="${XDG_CACHE_HOME:-${HOME}/.cache}/kms-intermediate-rotator/proto-baseline"
+if [[ -e "${baseline}/.git" ]]; then
+	git -C "${baseline}" checkout --quiet --detach "${base}"
+else
+	mkdir -p "$(dirname "${baseline}")"
+	git worktree prune
+	git worktree add --quiet --detach "${baseline}" "${base}"
+fi
+
+# An API the earlier commit does not have has no contract to break yet: it is
+# new, or it was moved (a renamed proto package is a new API, and every client
+# has to move to it).
+if [[ ! -e "${baseline}/config/v1/BUILD.bazel" ]]; then
+	echo "proto-breaking: ${base:0:12} has no //config/v1, nothing to compare"
+	exit 0
+fi
+
+image "${baseline}" "${work}/base.binpb" "$@"
+image "${PWD}" "${work}/head.binpb" "$@"
+
+# --path keeps the check to this repository's own files: the images also hold what
+# they import, and a dependency's change is not ours to refuse.
+bazel run "$@" @rules_buf_toolchains//:buf -- breaking "${work}/head.binpb" \
+	--against "${work}/base.binpb" --config "${PWD}/buf.yaml" --path config
+echo "proto-breaking: no breaking change since ${base:0:12}"

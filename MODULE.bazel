@@ -11,6 +11,23 @@ bazel_dep(name = "platforms", version = "1.1.0")
 # removed incompatible_use_toolchain_transition keyword.
 bazel_dep(name = "rules_pkg", version = "1.3.0")
 
+# proto_library, and protoc for the configuration schema (config/v1).
+bazel_dep(name = "protobuf", version = "36.2")
+
+# The protovalidate annotations (buf/validate/validate.proto) the configuration
+# schema is written with. The Go runtime that enforces them is the Go module
+# buf.build/go/protovalidate (go.mod).
+bazel_dep(name = "protovalidate", version = "1.2.2")
+
+# protovalidate asks for an older googleapis, whose dependencies (an old
+# rules_foreign_cc) do not load with this Bazel; a newer one does.
+bazel_dep(name = "googleapis", version = "0.0.0-20260929-28769825")
+
+# buf lints the configuration schema (//config/v1:config_proto_lint_test),
+# checks it for breaking changes (scripts/proto-breaking.sh) and formats it.
+# Only its checks are used: protoc compiles, and rules_go generates.
+bazel_dep(name = "rules_buf", version = "0.5.4")
+
 # Named by bazel/lint's gocognit aspect for its public setting types, and
 # already in the graph through rules_go; declared so a bump cannot drop it.
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
@@ -26,10 +43,17 @@ bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "rules_img_signer_cosign", version = "0.0.1")
 
 # Formatting and the linters that are not part of compiling: //bazel/format
-# formats and checks Starlark (buildifier, with its lint warnings), Go and
-# shell; //bazel/lint has the shellcheck and gocognit aspects.
+# formats and checks Starlark (buildifier, with its lint warnings), Go, shell
+# and protos; //bazel/lint has the shellcheck and gocognit aspects.
 bazel_dep(name = "aspect_rules_lint", version = "2.9.1")
 bazel_dep(name = "buildifier_prebuilt", version = "10.1.0")
+
+buf = use_extension("@rules_buf//buf:extensions.bzl", "buf")
+buf.toolchains(
+    sha256 = "18f603d3b418f6a1259da4425b04bbe2fbaf60c2b796b98114d961e8736198b9",
+    version = "v1.73.0",
+)
+use_repo(buf, "rules_buf_toolchains")
 
 # The Go toolchain, from go.mod's `go` line.
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
@@ -42,4 +66,23 @@ go_sdk.nogo(nogo = "//:nogo")
 
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//:go.mod")
-use_repo(go_deps, "co_honnef_go_tools", "com_github_aws_aws_lambda_go", "com_github_aws_aws_sdk_go_v2", "com_github_aws_aws_sdk_go_v2_config", "com_github_aws_aws_sdk_go_v2_service_kms", "com_github_aws_aws_sdk_go_v2_service_secretsmanager", "com_github_aws_aws_sdk_go_v2_service_ssm", "com_github_uudashr_gocognit")
+
+# cel-go (protovalidate's expression engine) ships BUILD files that name every
+# library go_default_library, which is not what Gazelle names a dependency's
+# libraries here (//ext:ext); generate them again.
+go_deps.gazelle_override(
+    build_file_generation = "clean",
+    path = "cel.dev/cel-go",
+)
+
+# intermediate-ca-format's own BUILD files load rules (protobuf, rules_buf,
+# rules_shell) that a Go module repository cannot see, so they are generated
+# again: only the Go libraries, from the committed secret.pb.go (that
+# module's intermediateca/v1 is `# gazelle:proto disable` for the same
+# reason).
+go_deps.gazelle_override(
+    build_file_generation = "clean",
+    directives = ["gazelle:proto disable"],
+    path = "github.com/bpalermo/intermediate-ca-format",
+)
+use_repo(go_deps, "build_buf_gen_go_bufbuild_protovalidate_protocolbuffers_go", "build_buf_go_protovalidate", "co_honnef_go_tools", "com_github_aws_aws_lambda_go", "com_github_aws_aws_sdk_go_v2", "com_github_aws_aws_sdk_go_v2_config", "com_github_aws_aws_sdk_go_v2_service_kms", "com_github_aws_aws_sdk_go_v2_service_secretsmanager", "com_github_aws_aws_sdk_go_v2_service_ssm", "com_github_bpalermo_intermediate_ca_format", "com_github_uudashr_gocognit", "org_golang_google_protobuf")

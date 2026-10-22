@@ -48,14 +48,14 @@ jobs:
           repository-cache: true
           cache-save: ${{ github.ref == 'refs/heads/main' }}
 
-      # Starlark (with buildifier's lint warnings), Go and shell. The loop is
-      # there because a language whose formatter did not run reports nothing,
-      # which looks the same as clean.
+      # Starlark (with buildifier's lint warnings), Go, shell and protos. The
+      # loop is there because a language whose formatter did not run reports
+      # nothing, which looks the same as clean.
       - name: Everything is formatted
         run: |
           out="$(bazel run --config=ci //:format.check 2>&1)" || { echo "${out}"; echo "::error::run 'bazel run //:format'" >&2; exit 1; }
           echo "${out}"
-          for language in Starlark Go Shell; do
+          for language in Starlark Go Shell "Protocol Buffer"; do
             if ! grep -q "^Formatted ${language} " <<<"${out}"; then
               echo "::error::the formatter did not run for ${language}" >&2
               exit 1
@@ -173,6 +173,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          # The whole history: the configuration schema is compared with the
+          # commit this one is based on.
+          fetch-depth: 0
 
       - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
         with:
@@ -220,6 +223,25 @@ jobs:
       - name: bazel test the impacted tests
         if: needs.diff.outputs.has_test == 'true'
         run: bazel test --config=ci --target_pattern_file="${RUNNER_TEMP}/impacted/impacted_test.txt"
+
+      # A field renamed, retyped or removed from the configuration schema: a
+      # configuration that works today must keep working after an upgrade. A
+      # pull request is compared with the commit it branched from; a push to
+      # main with the commit before it, since merges are squashed. buf lint is
+      # a test (//config/v1:config_proto_lint_test), run above when the schema
+      # is impacted.
+      - name: The configuration schema keeps its compatibility
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "${BASE_REF}" ]; then
+            against="origin/${BASE_REF}"
+          elif [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            against="HEAD^"
+          else
+            against="origin/main"
+          fi
+          scripts/proto-breaking.sh "${against}" --config=ci
 
   # The single check a ruleset should require. A required status check is
   # matched by check-run name, so requiring the jobs themselves ties the

@@ -1,6 +1,12 @@
 // Package config loads and validates the rotator's configuration: inline
 // JSON from ROTATOR_CONFIG, or the value of the SSM parameter named by
 // ROTATOR_CONFIG_PARAMETER. Exactly one of the two must be set.
+//
+// The configuration is the protobuf JSON of configv1.Config
+// (config/v1/config.proto). Parse decodes it strictly (an unknown field is
+// an error), checks it against the schema's protovalidate rules, then checks
+// what the schema cannot: the root certificate, and each secret's path
+// length against it.
 package config
 
 import (
@@ -8,17 +14,20 @@ import (
 	"context"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"buf.build/go/protovalidate"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	"google.golang.org/protobuf/encoding/protojson"
 
+	configv1 "github.com/bpalermo/kms-intermediate-rotator/config/v1"
 	"github.com/bpalermo/kms-intermediate-rotator/intermediate"
-	"github.com/bpalermo/kms-intermediate-rotator/secretformat"
 )
 
 // The environment variables the configuration comes from.
@@ -38,74 +47,26 @@ type ParameterGetter interface {
 	GetParameter(ctx context.Context, in *ssm.GetParameterInput, optFns ...func(*ssm.Options)) (*ssm.GetParameterOutput, error)
 }
 
-// Config is the rotator's configuration.
+// Config is the rotator's configuration, validated, with the defaults filled
+// in.
 type Config struct {
 	// KMSKeyID is the root's KMS key: an ID, ARN, alias name or alias ARN.
-	KMSKeyID string `json:"kms_key_id"`
-	// RootCertificate is the root's certificate, PEM: exactly one.
-	RootCertificate string `json:"root_certificate"`
+	KMSKeyID string
 	// SigningAlgorithm is a KMS signing algorithm; empty derives it from
 	// the key spec.
-	SigningAlgorithm string `json:"signing_algorithm"`
-	// Secrets is what to issue for each secret, by secret ARN.
-	Secrets map[string]*Secret `json:"secrets"`
-
-	// Root is RootCertificate, parsed.
-	Root *x509.Certificate `json:"-"`
+	SigningAlgorithm string
+	// Root is the root certificate, parsed.
+	Root *x509.Certificate
+	// Secrets is what to issue for each secret, by the configured ARN.
+	Secrets map[string]*Secret
+	// Raw is the configuration as decoded.
+	Raw *configv1.Config
 }
 
 // Secret is the configuration of the intermediate kept in one secret.
 type Secret struct {
-	Subject         Subject         `json:"subject"`
-	KeyType         string          `json:"key_type"`
-	Validity        Duration        `json:"validity"`
-	MaxPathLen      *int            `json:"max_path_len"`
-	NameConstraints NameConstraints `json:"name_constraints"`
-	// MinRemaining is the least validity a pending intermediate must have
-	// left for testSecret to promote it; default half of Validity.
-	MinRemaining Duration `json:"min_remaining"`
-}
-
-// Subject is the intermediate's subject name.
-type Subject struct {
-	CommonName         string   `json:"common_name"`
-	Organization       []string `json:"organization"`
-	OrganizationalUnit []string `json:"organizational_unit"`
-	Country            []string `json:"country"`
-	Province           []string `json:"province"`
-	Locality           []string `json:"locality"`
-}
-
-// NameConstraints are the intermediate's name constraints.
-type NameConstraints struct {
-	PermittedURIDomains []string `json:"permitted_uri_domains"`
-	ExcludedURIDomains  []string `json:"excluded_uri_domains"`
-	PermittedDNSDomains []string `json:"permitted_dns_domains"`
-	ExcludedDNSDomains  []string `json:"excluded_dns_domains"`
-}
-
-// Duration is a time.Duration written as a Go duration string ("2160h").
-type Duration time.Duration
-
-// UnmarshalJSON parses a duration string.
-func (d *Duration) UnmarshalJSON(b []byte) error {
-	var s string
-	if err := json.Unmarshal(b, &s); err != nil {
-		return fmt.Errorf("duration must be a string such as \"2160h\": %w", err)
-	}
-	if s == "" {
-		*d = 0
-		return nil
-	}
-	v, err := time.ParseDuration(s)
-	if err != nil {
-		return err
-	}
-	if v <= 0 {
-		return fmt.Errorf("duration %q is not positive", s)
-	}
-	*d = Duration(v)
-	return nil
+	// Profile is what the rotator issues, with the defaults filled in.
+	Profile intermediate.Profile
 }
 
 // Load reads the configuration from the environment (getenv) and, for the
@@ -134,50 +95,103 @@ func Load(ctx context.Context, getenv func(string) string, params ParameterGette
 }
 
 // Parse decodes and validates a configuration and fills in the defaults.
-// Unknown fields are errors, so that a misspelt setting is not ignored.
+// Unknown fields are errors, so that a misspelt setting is not ignored. No
+// error it returns contains the root certificate.
 func Parse(data []byte) (*Config, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	var c Config
-	if err := dec.Decode(&c); err != nil {
+	raw := &configv1.Config{}
+	if err := (protojson.UnmarshalOptions{}).Unmarshal(data, raw); err != nil {
+		// protojson's message names the field and the JSON token it could not
+		// take, and quotes no more of the input than that token; a string
+		// token is quoted whole, though, and could be a certificate.
+		if strings.Contains(err.Error(), "-----BEGIN") {
+			return nil, errors.New("config: not a configuration document: a certificate where another value belongs")
+		}
 		return nil, fmt.Errorf("config: %w", err)
 	}
-	if dec.More() {
-		return nil, errors.New("config: trailing data after the JSON object")
-	}
-	if err := c.validate(); err != nil {
+	if err := validate(raw); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
-	return &c, nil
+	c, err := build(raw)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	return c, nil
 }
 
-func (c *Config) validate() error {
-	if strings.TrimSpace(c.KMSKeyID) == "" {
-		return errors.New("kms_key_id is required")
+var (
+	validatorOnce sync.Once
+	validator     protovalidate.Validator
+	validatorErr  error
+)
+
+// validate checks raw against the rules of config.proto. The error lists
+// each violation by field path, rule ID and the rule's message, none of
+// which holds a field's value.
+func validate(raw *configv1.Config) error {
+	validatorOnce.Do(func() { validator, validatorErr = protovalidate.New() })
+	if validatorErr != nil {
+		return fmt.Errorf("building the validator: %w", validatorErr)
 	}
-	root, err := secretformat.ParseOneCertificate(c.RootCertificate)
+	err := validator.Validate(raw)
+	if err == nil {
+		return nil
+	}
+	var verr *protovalidate.ValidationError
+	if !errors.As(err, &verr) {
+		// A rule that could not be evaluated, such as a duration too long
+		// to represent.
+		return fmt.Errorf("invalid: %w", err)
+	}
+	reasons := make([]string, 0, len(verr.Violations))
+	for _, v := range verr.Violations {
+		reasons = append(reasons, fmt.Sprintf("%s: %s [%s]",
+			protovalidate.FieldPathString(v.Proto.GetField()), v.Proto.GetMessage(), v.Proto.GetRuleId()))
+	}
+	return fmt.Errorf("invalid: %s", strings.Join(reasons, "; "))
+}
+
+// build makes the Config of a configuration that satisfies the schema.
+func build(raw *configv1.Config) (*Config, error) {
+	root, err := parseRoot(raw.GetRootCertificate())
 	if err != nil {
-		return fmt.Errorf("root_certificate: %w", err)
+		return nil, fmt.Errorf("root_certificate: %w", err)
 	}
 	if err := checkRoot(root); err != nil {
-		return fmt.Errorf("root_certificate: %w", err)
+		return nil, fmt.Errorf("root_certificate: %w", err)
 	}
-	c.Root = root
-	if len(c.Secrets) == 0 {
-		return errors.New("secrets: at least one secret is required")
+	c := &Config{
+		KMSKeyID:         raw.GetKmsKeyId(),
+		SigningAlgorithm: raw.GetSigningAlgorithm(),
+		Root:             root,
+		Secrets:          make(map[string]*Secret, len(raw.GetSecrets())),
+		Raw:              raw,
 	}
-	for arn, s := range c.Secrets {
-		if !isSecretARN(arn) {
-			return fmt.Errorf("secrets: %q is not a Secrets Manager secret ARN", arn)
+	for arn, s := range raw.GetSecrets() {
+		p, err := profile(s, root)
+		if err != nil {
+			return nil, fmt.Errorf("secrets[%s]: %w", arn, err)
 		}
-		if s == nil {
-			return fmt.Errorf("secrets[%s]: empty", arn)
-		}
-		if err := s.validate(root); err != nil {
-			return fmt.Errorf("secrets[%s]: %w", arn, err)
-		}
+		c.Secrets[arn] = &Secret{Profile: p}
 	}
-	return nil
+	return c, nil
+}
+
+// parseRoot parses exactly one PEM certificate, and nothing else: no other
+// block, no text after it (the schema refuses text before it).
+func parseRoot(s string) (*x509.Certificate, error) {
+	block, rest := pem.Decode([]byte(s))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, errors.New("not a PEM certificate")
+	}
+	if len(bytes.TrimSpace(rest)) != 0 {
+		return nil, errors.New("more than one PEM block, or text after it: want exactly one certificate")
+	}
+	root, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		// The parser's message describes the encoding, not the contents.
+		return nil, fmt.Errorf("not an X.509 certificate: %w", err)
+	}
+	return root, nil
 }
 
 // checkRoot refuses a root that cannot issue the intermediate.
@@ -202,78 +216,64 @@ func rootPathLen(root *x509.Certificate) int {
 	return -1
 }
 
-func (s *Secret) validate(root *x509.Certificate) error {
-	if strings.TrimSpace(s.Subject.CommonName) == "" {
-		return errors.New("subject.common_name is required")
+// profile is the intermediate.Profile of s, with the defaults, checked
+// against root. s satisfies the schema.
+func profile(s *configv1.SecretProfile, root *x509.Certificate) (intermediate.Profile, error) {
+	p := intermediate.Profile{
+		Subject:         subject(s.GetSubject()),
+		KeyType:         intermediate.KeyType(s.GetKeyType()),
+		Validity:        DefaultValidity,
+		MaxPathLen:      DefaultMaxPathLen,
+		NameConstraints: nameConstraints(s.GetNameConstraints()),
 	}
-	if s.KeyType == "" {
-		s.KeyType = string(intermediate.DefaultKeyType)
+	if p.KeyType == "" {
+		p.KeyType = intermediate.DefaultKeyType
 	}
-	if !intermediate.KeyType(s.KeyType).Valid() {
-		return fmt.Errorf("unknown key_type %q (want ec-p256, ec-p384, rsa-2048 or rsa-4096)", s.KeyType)
+	var err error
+	if v := s.GetValidity(); v != "" {
+		if p.Validity, err = time.ParseDuration(v); err != nil {
+			return p, fmt.Errorf("validity: %w", err)
+		}
 	}
-	if s.Validity == 0 {
-		s.Validity = Duration(DefaultValidity)
+	p.MinRemaining = p.Validity / 2
+	if v := s.GetMinRemaining(); v != "" {
+		if p.MinRemaining, err = time.ParseDuration(v); err != nil {
+			return p, fmt.Errorf("min_remaining: %w", err)
+		}
 	}
-	if s.MaxPathLen == nil {
-		n := DefaultMaxPathLen
-		s.MaxPathLen = &n
+	// The schema compares the two when both are set; this also covers the
+	// default validity.
+	if p.MinRemaining > p.Validity {
+		return p, fmt.Errorf("min_remaining %s is longer than validity %s", p.MinRemaining, p.Validity)
 	}
-	if *s.MaxPathLen < 0 {
-		return fmt.Errorf("max_path_len %d is negative", *s.MaxPathLen)
+	if s.MaxPathLen != nil {
+		p.MaxPathLen = int(s.GetMaxPathLen())
 	}
 	// The intermediate is one CA below the root; its own path length must
 	// fit in what is left.
-	if n := rootPathLen(root); n >= 0 && *s.MaxPathLen > n-1 {
-		return fmt.Errorf("max_path_len %d does not fit under the root's path length %d (at most %d)", *s.MaxPathLen, n, n-1)
+	if n := rootPathLen(root); n >= 0 && p.MaxPathLen > n-1 {
+		return p, fmt.Errorf("max_path_len %d does not fit under the root's path length %d (at most %d)", p.MaxPathLen, n, n-1)
 	}
-	if s.MinRemaining == 0 {
-		s.MinRemaining = s.Validity / 2
-	}
-	if s.MinRemaining > s.Validity {
-		return fmt.Errorf("min_remaining %s is longer than validity %s", time.Duration(s.MinRemaining), time.Duration(s.Validity))
-	}
-	return s.NameConstraints.validate()
+	return p, nil
 }
 
-func (n NameConstraints) validate() error {
-	lists := map[string][]string{
-		"permitted_uri_domains": n.PermittedURIDomains,
-		"excluded_uri_domains":  n.ExcludedURIDomains,
-		"permitted_dns_domains": n.PermittedDNSDomains,
-		"excluded_dns_domains":  n.ExcludedDNSDomains,
+func subject(s *configv1.Subject) pkix.Name {
+	return pkix.Name{
+		CommonName:         s.GetCommonName(),
+		Organization:       s.GetOrganization(),
+		OrganizationalUnit: s.GetOrganizationalUnit(),
+		Country:            s.GetCountry(),
+		Province:           s.GetProvince(),
+		Locality:           s.GetLocality(),
 	}
-	for field, list := range lists {
-		for _, d := range list {
-			if d == "" || strings.ContainsAny(d, " \t/:@*") {
-				return fmt.Errorf("name_constraints.%s: %q is not a domain", field, d)
-			}
-		}
-	}
-	return nil
 }
 
-// Profile is the intermediate.Profile of s. s must have been validated.
-func (s *Secret) Profile() intermediate.Profile {
-	return intermediate.Profile{
-		Subject: pkix.Name{
-			CommonName:         s.Subject.CommonName,
-			Organization:       s.Subject.Organization,
-			OrganizationalUnit: s.Subject.OrganizationalUnit,
-			Country:            s.Subject.Country,
-			Province:           s.Subject.Province,
-			Locality:           s.Subject.Locality,
-		},
-		KeyType:      intermediate.KeyType(s.KeyType),
-		Validity:     time.Duration(s.Validity),
-		MaxPathLen:   *s.MaxPathLen,
-		MinRemaining: time.Duration(s.MinRemaining),
-		NameConstraints: intermediate.NameConstraints{
-			PermittedURIDomains: s.NameConstraints.PermittedURIDomains,
-			ExcludedURIDomains:  s.NameConstraints.ExcludedURIDomains,
-			PermittedDNSDomains: s.NameConstraints.PermittedDNSDomains,
-			ExcludedDNSDomains:  s.NameConstraints.ExcludedDNSDomains,
-		},
+func nameConstraints(n *configv1.NameConstraints) intermediate.NameConstraints {
+	return intermediate.NameConstraints{
+		PermittedURIDomains: n.GetPermittedUriDomains(),
+		ExcludedURIDomains:  n.GetExcludedUriDomains(),
+		PermittedDNSDomains: n.GetPermittedDnsDomains(),
+		ExcludedDNSDomains:  n.GetExcludedDnsDomains(),
 	}
 }
 

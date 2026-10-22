@@ -6,6 +6,12 @@ load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//bazel/nogo:staticcheck.bzl", "STATICCHECK")
 
 # gazelle:prefix github.com/bpalermo/kms-intermediate-rotator
+#
+# The configuration schema (config/v1) imports the protovalidate annotations:
+# their proto_library is the protovalidate module's, and their Go package the
+# buf.build/gen/go module of go.mod.
+# gazelle:resolve proto buf/validate/validate.proto @protovalidate//proto/protovalidate/buf/validate:validate_proto
+# gazelle:resolve proto go buf/validate/validate.proto @build_buf_gen_go_bufbuild_protovalidate_protocolbuffers_go//buf/validate
 
 gazelle(name = "gazelle")
 
@@ -20,8 +26,13 @@ nogo(
 
 exports_files([
     ".shellcheckrc",
+    # Its example configuration is parsed by //config:config_test.
+    "README.md",
     # The release being worked towards; see bazel/workspace_status.sh.
     "VERSION",
+    # The buf configuration: its lint rules (//config/v1) and its
+    # breaking-change rules (scripts/proto-breaking.sh).
+    "buf.yaml",
 ])
 
 alias(

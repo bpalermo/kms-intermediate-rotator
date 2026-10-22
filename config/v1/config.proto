@@ -1,0 +1,222 @@
+// The rotator's configuration: ROTATOR_CONFIG, or the value of the SSM
+// parameter ROTATOR_CONFIG_PARAMETER names.
+//
+// The configuration is the protobuf JSON mapping of Config, read strictly: an
+// unknown field is an error, so that a misspelt setting is not ignored. The
+// field names are the snake_case names below (protobuf JSON also accepts
+// their lowerCamelCase form). The rules here are checked first; then the Go
+// code (package config) checks what a schema cannot: that root_certificate
+// is a CA certificate that can issue the intermediates configured, and, at
+// start, that it is the KMS key's.
+syntax = "proto3";
+
+package config.v1;
+
+import "buf/validate/validate.proto";
+
+option go_package = "github.com/bpalermo/kms-intermediate-rotator/config/v1;configv1";
+
+// Config is the whole configuration of one rotator.
+message Config {
+  // kms_key_id is the root's KMS key: a key ID, key ARN, alias name
+  // ("alias/...") or alias ARN, of an asymmetric SIGN_VERIFY key.
+  string kms_key_id = 1 [(buf.validate.field) = {
+    required: true
+    string: {
+      max_len: 2048
+      pattern: "^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32}|alias/[A-Za-z0-9/_-]+|arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:(key/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})|alias/[A-Za-z0-9/_-]+))$"
+    }
+  }];
+
+  // root_certificate is the root CA's certificate: exactly one PEM
+  // "CERTIFICATE" block. Its public key must be the KMS key's.
+  string root_certificate = 2 [(buf.validate.field) = {
+    required: true
+    string: {
+      prefix: "-----BEGIN CERTIFICATE-----"
+      max_bytes: 16384
+    }
+  }];
+
+  // signing_algorithm is the KMS signing algorithm to sign with. Empty
+  // derives it from the key spec: ECC_NIST_P256 -> ECDSA_SHA_256,
+  // ECC_NIST_P384 -> ECDSA_SHA_384, ECC_NIST_P521 -> ECDSA_SHA_512, RSA_* ->
+  // RSASSA_PKCS1_V1_5_SHA_256.
+  string signing_algorithm = 3 [(buf.validate.field) = {
+    ignore: IGNORE_IF_ZERO_VALUE
+    string: {
+      in: [
+        "ECDSA_SHA_256",
+        "ECDSA_SHA_384",
+        "ECDSA_SHA_512",
+        "RSASSA_PKCS1_V1_5_SHA_256",
+        "RSASSA_PKCS1_V1_5_SHA_384",
+        "RSASSA_PKCS1_V1_5_SHA_512",
+        "RSASSA_PSS_SHA_256",
+        "RSASSA_PSS_SHA_384",
+        "RSASSA_PSS_SHA_512"
+      ]
+    }
+  }];
+
+  // secrets says what to issue for each rotated secret, keyed by the
+  // secret's ARN: the full ARN (with the six random characters Secrets
+  // Manager appends to the name) or the ARN without them. An event for any
+  // other secret fails.
+  map<string, SecretProfile> secrets = 4 [(buf.validate.field) = {
+    map: {
+      min_pairs: 1
+      keys: {
+        string: {
+          max_len: 2048
+          pattern: "^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$"
+        }
+      }
+    }
+  }];
+}
+
+// SecretProfile is the intermediate CA kept in one secret: what the rotator
+// issues, and what testSecret holds a pending version to.
+message SecretProfile {
+  option (buf.validate.message).cel = {
+    id: "secret_profile.min_remaining_within_validity"
+    message: "min_remaining must not be longer than validity"
+    // Only when both are set and well formed (the field rules report the
+    // others); with validity unset, the Go code checks min_remaining against
+    // the default validity.
+    expression: "this.min_remaining == '' || this.validity == '' || !this.min_remaining.matches(r'^[+]?(([0-9]+([.][0-9]*)?|[.][0-9]+)(ns|us|ms|s|m|h))+$') || !this.validity.matches(r'^[+]?(([0-9]+([.][0-9]*)?|[.][0-9]+)(ns|us|ms|s|m|h))+$') || duration(this.min_remaining) <= duration(this.validity)"
+  };
+
+  // subject is the intermediate's subject name.
+  Subject subject = 1 [(buf.validate.field).required = true];
+
+  // key_type is the intermediate's key: "ec-p256", "ec-p384", "rsa-2048" or
+  // "rsa-4096". Empty is "ec-p256".
+  string key_type = 2 [(buf.validate.field) = {
+    ignore: IGNORE_IF_ZERO_VALUE
+    string: {
+      in: [
+        "ec-p256",
+        "ec-p384",
+        "rsa-2048",
+        "rsa-4096"
+      ]
+    }
+  }];
+
+  // validity is how long an intermediate is valid for, as a Go duration
+  // string of "h", "m", "s", "ms", "us" and "ns" units ("2160h"), positive.
+  // It is capped at the root's expiry. Empty is "2160h" (90 days).
+  string validity = 3 [(buf.validate.field) = {
+    ignore: IGNORE_IF_ZERO_VALUE
+    string: {max_len: 64}
+    cel: {
+      id: "secret_profile.validity.positive_duration"
+      message: "must be a positive duration such as \"2160h\""
+      expression: "this.matches(r'^[+]?(([0-9]+([.][0-9]*)?|[.][0-9]+)(ns|us|ms|s|m|h))+$') && duration(this) > duration('0s')"
+    }
+  }];
+
+  // min_remaining is the least validity a pending intermediate must have
+  // left for testSecret to promote it, as a Go duration string like
+  // validity; at most validity. Empty is half of validity.
+  string min_remaining = 4 [(buf.validate.field) = {
+    ignore: IGNORE_IF_ZERO_VALUE
+    string: {max_len: 64}
+    cel: {
+      id: "secret_profile.min_remaining.positive_duration"
+      message: "must be a positive duration such as \"1080h\""
+      expression: "this.matches(r'^[+]?(([0-9]+([.][0-9]*)?|[.][0-9]+)(ns|us|ms|s|m|h))+$') && duration(this) > duration('0s')"
+    }
+  }];
+
+  // max_path_len is the intermediate's path length constraint: how many CAs
+  // may follow it in a chain. It must also fit under the root's own path
+  // length (at most the root's path length - 1). Unset is 1.
+  optional int32 max_path_len = 5 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 8
+  }];
+
+  // name_constraints are the intermediate's name constraints; none when
+  // unset.
+  NameConstraints name_constraints = 6;
+}
+
+// Subject is an X.509 distinguished name.
+message Subject {
+  // common_name is the CN, required and not only white space.
+  string common_name = 1 [(buf.validate.field).string = {
+    pattern: "[^ \\t\\r\\n]"
+    max_len: 64
+  }];
+
+  // organization is the O attributes.
+  repeated string organization = 2;
+
+  // organizational_unit is the OU attributes.
+  repeated string organizational_unit = 3;
+
+  // country is the C attributes.
+  repeated string country = 4;
+
+  // province is the ST attributes.
+  repeated string province = 5;
+
+  // locality is the L attributes.
+  repeated string locality = 6;
+}
+
+// NameConstraints are an intermediate's X.509 name constraints. Each entry
+// is a host name, optionally with a leading dot. "example.org" and
+// ".example.org" do not mean the same to every verifier: see the README.
+message NameConstraints {
+  // permitted_uri_domains are the hosts URI SANs below the intermediate
+  // must be in.
+  repeated string permitted_uri_domains = 1 [(buf.validate.field).repeated = {
+    max_items: 64
+    items: {
+      string: {
+        max_len: 253
+        pattern: "^[.]?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+      }
+    }
+  }];
+
+  // excluded_uri_domains are the hosts URI SANs below the intermediate must
+  // not be in.
+  repeated string excluded_uri_domains = 2 [(buf.validate.field).repeated = {
+    max_items: 64
+    items: {
+      string: {
+        max_len: 253
+        pattern: "^[.]?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+      }
+    }
+  }];
+
+  // permitted_dns_domains are the domains DNS SANs below the intermediate
+  // must be in.
+  repeated string permitted_dns_domains = 3 [(buf.validate.field).repeated = {
+    max_items: 64
+    items: {
+      string: {
+        max_len: 253
+        pattern: "^[.]?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+      }
+    }
+  }];
+
+  // excluded_dns_domains are the domains DNS SANs below the intermediate
+  // must not be in.
+  repeated string excluded_dns_domains = 4 [(buf.validate.field).repeated = {
+    max_items: 64
+    items: {
+      string: {
+        max_len: 253
+        pattern: "^[.]?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?([.][A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+      }
+    }
+  }];
+}

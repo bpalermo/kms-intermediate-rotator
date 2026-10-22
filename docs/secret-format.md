@@ -1,27 +1,17 @@
-# Secret format v1 (`intermediate-ca/v1`)
+# Secret format (`intermediate-ca/v1`)
 
-This is the contract between this rotator, which writes the secret, and its
-readers (such as a SPIRE UpstreamAuthority plugin kept in a separate
-repository). They share no code; this document is the agreement. The section
-below is normative and is kept word for word in step with the readers' copy.
+The secret this rotator writes is in the `intermediate-ca/v1` format, which is
+specified, with its protobuf schema and its conformance test documents, in
+[bpalermo/intermediate-ca-format](https://github.com/bpalermo/intermediate-ca-format):
+see its
+[docs/secret-format.md](https://github.com/bpalermo/intermediate-ca-format/blob/11d2a916960bad46d75ce9e7fcbc999dbf9b069c/docs/secret-format.md)
+(at the commit `go.mod` pins). That document is the contract with the
+secret's readers; nothing here changes it.
 
-## Format
-
-`SecretString` is JSON:
-
-```json
-{
-  "format": "intermediate-ca/v1",
-  "cert":  "-----BEGIN CERTIFICATE-----\n...",      // the intermediate CA, PEM, exactly one cert
-  "key":   "-----BEGIN PRIVATE KEY-----\n...",      // its private key, PKCS#8 PEM
-  "chain": "",                                       // PEM certs between cert and root, may be empty
-  "root":  "-----BEGIN CERTIFICATE-----\n..."       // the trust anchor, PEM, exactly one cert
-}
-```
-
-Readers MUST reject an unknown `format`, a `cert` whose public key does not match `key`, and
-a `cert` that does not verify to `root` through `chain`. Unknown extra fields are ignored.
-
+The rotator uses that module's Go package (`intermediateca`) to write the
+secret (`Encode`) and, as any reader does, to check it (`DecodeAt`): before a
+new version is stored, and again in testSecret. Its version is the one in
+`go.mod`.
 
 ## What this rotator writes
 
@@ -32,6 +22,18 @@ Informative, not part of the contract:
 - `key` is a newly generated key of the configured `key_type`, as an
   unencrypted PKCS#8 `PRIVATE KEY` block. The key exists only in the Lambda's
   memory and in the secret.
-- The JSON has exactly the five fields above. `secretformat` is the
-  implementation (`Decode` is what a reader must do: parse, then reject a key
-  that does not match and a cert that does not verify).
+- The JSON is what `intermediateca.Encode` writes: compact, with exactly the
+  five fields, in the order `format`, `cert`, `key`, `chain`, `root`.
+
+## What testSecret checks beyond the format
+
+A pending version a reader would accept can still be refused by testSecret,
+which also requires that:
+
+- its `root` is the configured root certificate;
+- its `cert` is what createSecret issues from the secret's configuration
+  (subject, key type, basic constraints and path length, key usage, name
+  constraints, with their criticality);
+- a chain as deep as the `cert`'s path length allows verifies to the root;
+- its lifetime is the configured `validity` (or up to the root's expiry), and
+  at least `min_remaining` of it is left.

@@ -1,5 +1,6 @@
 // Package rotation implements the four steps of an AWS Secrets Manager
-// rotation for a secret holding an intermediate CA in the secret format v1:
+// rotation for a secret holding an intermediate CA in the intermediate-ca/v1
+// secret format (github.com/bpalermo/intermediate-ca-format):
 // createSecret issues a new intermediate signed by the KMS root key,
 // setSecret does nothing, testSecret checks the new version, and
 // finishSecret makes it AWSCURRENT.
@@ -20,10 +21,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
 
+	intermediateca "github.com/bpalermo/intermediate-ca-format"
+
 	"github.com/bpalermo/kms-intermediate-rotator/config"
 	"github.com/bpalermo/kms-intermediate-rotator/intermediate"
 	"github.com/bpalermo/kms-intermediate-rotator/kmssigner"
-	"github.com/bpalermo/kms-intermediate-rotator/secretformat"
 )
 
 // The rotation steps.
@@ -75,7 +77,6 @@ type target struct {
 	arn           string
 	token         string
 	rotationToken string
-	secret        *config.Secret
 	profile       intermediate.Profile
 	desc          *secretsmanager.DescribeSecretOutput
 }
@@ -143,7 +144,7 @@ func (r *Rotator) target(ctx context.Context, ev Event) (*target, error) {
 	}
 	return &target{
 		arn: arn, token: ev.ClientRequestToken, rotationToken: ev.RotationToken,
-		secret: sc, profile: sc.Profile(), desc: desc,
+		profile: sc.Profile, desc: desc,
 	}, nil
 }
 
@@ -190,7 +191,7 @@ func (r *Rotator) createSecret(ctx context.Context, t *target, log *slog.Logger)
 }
 
 // issue makes a new key and intermediate, checks them, and returns the
-// certificate and the v1 secret value.
+// certificate and the intermediate-ca/v1 secret value.
 func (r *Rotator) issue(ctx context.Context, t *target) (*x509.Certificate, string, error) {
 	key, err := intermediate.GenerateKey(t.profile.KeyType)
 	if err != nil {
@@ -203,24 +204,25 @@ func (r *Rotator) issue(ctx context.Context, t *target) (*x509.Certificate, stri
 	if err != nil {
 		return nil, "", err
 	}
-	b := &secretformat.Bundle{Cert: cert, Key: key, Root: root}
-	if err := b.Verify(now); err != nil {
+	value, err := intermediateca.Encode(&intermediateca.Bundle{Cert: cert, Key: key, Root: root})
+	if err != nil {
+		return nil, "", fmt.Errorf("the new intermediate: %w", err)
+	}
+	// What a reader does with the value: if it refuses it, it is not stored.
+	if _, err := intermediateca.DecodeAt(value, now); err != nil {
 		return nil, "", fmt.Errorf("the new intermediate: %w", err)
 	}
 	if err := intermediate.VerifyDepth(cert, key, root, now); err != nil {
 		return nil, "", fmt.Errorf("the new intermediate: %w", err)
 	}
-	value, err := secretformat.Encode(b)
-	if err != nil {
-		return nil, "", err
-	}
-	return cert, value, nil
+	return cert, string(value), nil
 }
 
-// testSecret checks the AWSPENDING version: it is format v1, its key
-// matches its cert, the cert verifies to the configured root (also through
-// a chain as deep as its path length allows), it is what createSecret
-// issues, and it has enough validity left.
+// testSecret checks the AWSPENDING version: a reader of the format accepts
+// it (intermediateca.DecodeAt: its key matches its cert, the cert is a CA and
+// verifies to its root), that root is the configured one, a chain as deep as
+// the cert's path length allows verifies to it, the cert is what
+// createSecret issues, and it has enough validity left.
 //
 // A token whose AWSPENDING version has no value is a configuration test
 // (rotation set up without rotating immediately runs testSecret alone) and
@@ -245,7 +247,7 @@ func (r *Rotator) testSecret(ctx context.Context, t *target, log *slog.Logger) e
 
 func (r *Rotator) validatePending(value string, t *target) error {
 	now := r.now()
-	b, err := secretformat.Decode(value, now)
+	b, err := intermediateca.DecodeAt([]byte(value), now)
 	if err != nil {
 		return err
 	}

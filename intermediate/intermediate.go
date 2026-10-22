@@ -194,7 +194,7 @@ var (
 // basic constraints and path length, the key usage and the name constraints
 // equal the profile, with the criticality Issue gives them, and the key is
 // of the profile's type. It checks neither the validity window (see
-// CheckLifetime) nor the signature (see the secretformat package).
+// CheckLifetime) nor the signature (intermediateca.Decode does).
 func Check(cert *x509.Certificate, p Profile) error {
 	checks := []func(*x509.Certificate, Profile) error{
 		checkSubject,

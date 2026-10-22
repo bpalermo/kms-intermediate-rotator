@@ -9,10 +9,10 @@ go_library(
         "//config",
         "//intermediate",
         "//kmssigner",
-        "//secretformat",
         "@com_github_aws_aws_sdk_go_v2//aws",
         "@com_github_aws_aws_sdk_go_v2_service_secretsmanager//:secretsmanager",
         "@com_github_aws_aws_sdk_go_v2_service_secretsmanager//types",
+        "@com_github_bpalermo_intermediate_ca_format//:intermediate-ca-format",
     ],
 )
 
@@ -29,9 +29,9 @@ go_test(
         "//internal/kmsfake",
         "//internal/testca",
         "//kmssigner",
-        "//secretformat",
         "@com_github_aws_aws_sdk_go_v2//aws",
         "@com_github_aws_aws_sdk_go_v2_service_secretsmanager//:secretsmanager",
         "@com_github_aws_aws_sdk_go_v2_service_secretsmanager//types",
+        "@com_github_bpalermo_intermediate_ca_format//:intermediate-ca-format",
     ],
 )

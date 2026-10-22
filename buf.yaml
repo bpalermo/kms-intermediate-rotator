@@ -1,0 +1,17 @@
+# What buf checks in the protos. buf does not compile or generate anything
+# here: Bazel does. //config/v1:config_proto_lint_test runs the lint rules and
+# scripts/proto-breaking.sh the breaking ones.
+version: v2
+lint:
+  use:
+    - STANDARD
+    # Every message and field carries a comment: the comments are the
+    # reference documentation of the configuration.
+    - COMMENTS
+breaking:
+  use:
+    # The configuration is read as JSON (ROTATOR_CONFIG, or an SSM parameter)
+    # by Lambdas deployed separately from whoever writes it: no field renamed,
+    # retyped or deleted. The binary wire format is never used, so field
+    # numbers are free to change (they are still kept).
+    - WIRE_JSON

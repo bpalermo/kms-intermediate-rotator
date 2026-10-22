@@ -6,9 +6,10 @@ CA, signed by an AWS KMS key, in a secret.
 The root CA's private key stays in KMS. On each rotation the Lambda generates
 a new intermediate key, builds the intermediate certificate from its own
 configuration, has KMS sign it, and stores certificate, key and root in the
-secret in the [secret format v1](docs/secret-format.md). Whatever consumes the
-intermediate reads the secret's `AWSCURRENT` version; the rotator knows
-nothing about it.
+secret in the shared [`intermediate-ca/v1` format](https://github.com/bpalermo/intermediate-ca-format)
+(what this rotator writes, and checks beyond it: [docs/secret-format.md](docs/secret-format.md)).
+Whatever consumes the intermediate reads the secret's `AWSCURRENT` version;
+the rotator knows nothing about it.
 
 The Lambda (`main.go`, the root package) runs on the `provided.al2023` custom runtime, arm64
 or x86_64.
@@ -36,8 +37,9 @@ is already `AWSCURRENT` the step succeeds and does nothing; if it is not
    `VersionStages: [AWSPENDING]`). If a concurrent invocation for the same
    token stored its version first, that one is kept and the step succeeds.
 2. **setSecret**: nothing; there is no service to configure.
-3. **testSecret**: reads `AWSPENDING` and checks it as a reader would (format
-   v1, key matches cert, cert verifies to the root), that its root is the
+3. **testSecret**: reads `AWSPENDING` and checks it as a reader would (the
+   shared format's `Decode`: schema, key matches cert, cert is a CA and
+   verifies to the root), that its root is the
    configured one, that subject, basic constraints, path length, key usage,
    name constraints and key type equal the configuration, that a throwaway
    chain as deep as its path length allows (sub-CAs and a leaf, made in
@@ -127,6 +129,10 @@ Exactly one of these environment variables must be set:
 | `ROTATOR_CONFIG` | the configuration, inline JSON |
 | `ROTATOR_CONFIG_PARAMETER` | the name of an SSM parameter (`String` or `SecureString`) holding it, read once per cold start |
 
+The configuration is the protobuf JSON of `Config` in
+[config/v1/config.proto](config/v1/config.proto), which is its reference:
+every field, its default and its rules are there.
+
 ```json
 {
   "kms_key_id": "alias/example-root",
@@ -137,6 +143,7 @@ Exactly one of these environment variables must be set:
       "subject": {"common_name": "Example Intermediate CA", "organization": ["Example"], "country": ["US"]},
       "key_type": "ec-p256",
       "validity": "2160h",
+      "min_remaining": "1080h",
       "max_path_len": 1,
       "name_constraints": {
         "permitted_uri_domains": ["example.org"],
@@ -151,18 +158,27 @@ Exactly one of these environment variables must be set:
 
 | Field | Meaning | Default |
 | --- | --- | --- |
-| `kms_key_id` | the root's KMS key: key ID, key ARN, alias name or alias ARN; an asymmetric `SIGN_VERIFY` key | required |
-| `root_certificate` | the root certificate, PEM, exactly one; its public key must be the KMS key's | required |
+| `kms_key_id` | the root's KMS key: key ID, key ARN, alias name (`alias/...`) or alias ARN; an asymmetric `SIGN_VERIFY` key | required |
+| `root_certificate` | the root certificate: exactly one PEM `CERTIFICATE` block, nothing before or after it, at most 16 KiB; its public key must be the KMS key's | required |
 | `signing_algorithm` | a KMS signing algorithm (`ECDSA_SHA_256`, `ECDSA_SHA_384`, `ECDSA_SHA_512`, `RSASSA_PKCS1_V1_5_SHA_*`, `RSASSA_PSS_SHA_*`) | from the key spec: `ECC_NIST_P256` → `ECDSA_SHA_256`, `ECC_NIST_P384` → `ECDSA_SHA_384`, `ECC_NIST_P521` → `ECDSA_SHA_512`, `RSA_*` → `RSASSA_PKCS1_V1_5_SHA_256` |
-| `secrets` | per secret, by ARN: what to issue. Use the full ARN (with the six random characters Secrets Manager appends) or the ARN without them. An event for any other secret fails. | at least one |
-| `subject` | `common_name` (required), `organization`, `organizational_unit`, `country`, `province`, `locality` | |
+| `secrets` | per secret, by ARN (`arn:<partition>:secretsmanager:<region>:<account>:secret:<name>`): what to issue (a `SecretProfile`). Use the full ARN (with the six random characters Secrets Manager appends) or the ARN without them. An event for any other secret fails. | at least one |
+| `subject` | `common_name` (required, at most 64 characters), `organization`, `organizational_unit`, `country`, `province`, `locality` | required |
 | `key_type` | the intermediate's key: `ec-p256`, `ec-p384`, `rsa-2048`, `rsa-4096` | `ec-p256` |
-| `validity` | a Go duration (`h`, `m`, `s`), positive | `2160h` (90 days) |
-| `max_path_len` | path length constraint, 0 or more, at most the root's path length − 1 | `1` |
-| `min_remaining` | a Go duration: the least validity a pending intermediate must have left for testSecret to promote it; at most `validity` | half of `validity` |
-| `name_constraints` | `permitted_uri_domains`, `excluded_uri_domains`, `permitted_dns_domains`, `excluded_dns_domains` | none |
+| `validity` | a Go duration string of `h`, `m`, `s`, `ms`, `us`, `ns` (`"2160h"`, `"1.5h"`, `"2h30m"`), positive | `2160h` (90 days) |
+| `min_remaining` | a duration like `validity`: the least validity a pending intermediate must have left for testSecret to promote it; at most `validity` | half of `validity` |
+| `max_path_len` | path length constraint, 0 to 8, and at most the root's path length − 1 | `1` |
+| `name_constraints` | `permitted_uri_domains`, `excluded_uri_domains`, `permitted_dns_domains`, `excluded_dns_domains`: host names, each optionally with a leading dot (no scheme, port, path or wildcard), at most 64 per list | none |
 
-Unknown fields are errors, so a misspelt setting does not go unnoticed.
+An empty string is the same as a missing field. Unknown fields are errors, at
+every level, so a misspelt setting does not go unnoticed; protobuf JSON also
+accepts each field's lowerCamelCase name (`kmsKeyId`). The checks run in this
+order, and the first that fails stops the Lambda from starting: the JSON
+against the schema (unknown fields, types), the schema's rules
+(protovalidate), then the ones a schema cannot express: the root certificate
+parses and is a CA that may sign certificates and issue an intermediate
+(`keyCertSign`, a path length other than 0), each `max_path_len` fits under
+it, and, at start, the KMS key's public key is the root's. No error contains
+the certificate.
 
 ## Recovering a stuck rotation
 
