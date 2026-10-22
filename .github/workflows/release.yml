@@ -31,7 +31,7 @@ jobs:
       # there is no private key to store or rotate.
       id-token: write
     env:
-      # Keep equal to the platform list of //cmd/rotator:BUILD.bazel.
+      # Keep equal to the platform list in the root BUILD.bazel.
       PLATFORMS: linux_amd64 linux_arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -80,7 +80,7 @@ jobs:
           fi
           targets=()
           for platform in ${PLATFORMS}; do
-            targets+=("//cmd/rotator:zip_${platform}")
+            targets+=("//:zip_${platform}")
           done
           bazel build --config=ci "${targets[@]}" //bazel/cosign
 
@@ -96,9 +96,9 @@ jobs:
           rm -rf dist
           mkdir dist
           for platform in ${PLATFORMS}; do
-            built="$(bazel cquery --config=ci "//cmd/rotator:zip_${platform}" --output=files 2>/dev/null | head -1)"
+            built="$(bazel cquery --config=ci "//:zip_${platform}" --output=files 2>/dev/null | head -1)"
             if [ -z "${built}" ] || [ ! -s "${built}" ]; then
-              echo "::error::could not find the archive of //cmd/rotator:zip_${platform} (${built})" >&2
+              echo "::error::could not find the archive of //:zip_${platform} (${built})" >&2
               exit 1
             fi
             install -m 0644 "${built}" "dist/kms-intermediate-rotator_${version}_${platform}.zip"

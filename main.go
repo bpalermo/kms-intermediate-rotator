@@ -5,7 +5,7 @@
 // At start (once per cold start) it loads its configuration
 // (ROTATOR_CONFIG or ROTATOR_CONFIG_PARAMETER) and checks that the KMS key's
 // public key is the configured root certificate's; it refuses to run if
-// either fails. Then it serves rotation events (pkg/rotation).
+// either fails. Then it serves rotation events (rotation).
 package main
 
 import (
@@ -23,10 +23,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 
+	"github.com/bpalermo/kms-intermediate-rotator/config"
 	"github.com/bpalermo/kms-intermediate-rotator/internal/version"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/config"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/kmssigner"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/rotation"
+	"github.com/bpalermo/kms-intermediate-rotator/kmssigner"
+	"github.com/bpalermo/kms-intermediate-rotator/rotation"
 )
 
 // initTimeout bounds the start-up calls (SSM GetParameter, KMS

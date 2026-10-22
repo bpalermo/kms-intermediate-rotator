@@ -6,7 +6,7 @@ go_library(
         "intermediate.go",
         "key.go",
     ],
-    importpath = "github.com/bpalermo/kms-intermediate-rotator/pkg/intermediate",
+    importpath = "github.com/bpalermo/kms-intermediate-rotator/intermediate",
     visibility = ["//visibility:public"],
 )
 

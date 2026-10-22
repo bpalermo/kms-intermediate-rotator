@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bpalermo/kms-intermediate-rotator/intermediate"
 	"github.com/bpalermo/kms-intermediate-rotator/internal/testca"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/intermediate"
 )
 
 var (

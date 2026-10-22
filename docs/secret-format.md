@@ -32,6 +32,6 @@ Informative, not part of the contract:
 - `key` is a newly generated key of the configured `key_type`, as an
   unencrypted PKCS#8 `PRIVATE KEY` block. The key exists only in the Lambda's
   memory and in the secret.
-- The JSON has exactly the five fields above. `pkg/secretformat` is the
+- The JSON has exactly the five fields above. `secretformat` is the
   implementation (`Decode` is what a reader must do: parse, then reject a key
   that does not match and a cert that does not verify).

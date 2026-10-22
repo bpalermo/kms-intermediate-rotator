@@ -14,9 +14,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
 
+	"github.com/bpalermo/kms-intermediate-rotator/config"
+	"github.com/bpalermo/kms-intermediate-rotator/intermediate"
 	"github.com/bpalermo/kms-intermediate-rotator/internal/testca"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/config"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/intermediate"
 )
 
 const secretARN = "arn:aws:secretsmanager:us-east-1:111122223333:secret:example-AbCdEf"

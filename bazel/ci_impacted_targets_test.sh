@@ -17,15 +17,15 @@ trap 'rm -rf "${work}"' EXIT
 # The candidate lists, as the queries would answer them: the buildable rules
 # (sorted, no `manual` rule, so no //:gazelle) and the tests `bazel test //...` runs.
 cat >"${work}/rules.txt" <<'LIST'
-//cmd/rotator:rotator
-//cmd/rotator:rotator_linux_arm64
-//cmd/rotator:rotator_test
-//cmd/rotator:zip_linux_arm64
+//:rotator
+//:rotator_linux_arm64
+//:kms-intermediate-rotator_test
+//:zip_linux_arm64
 //internal/version:version
 //internal/version:version_test
 LIST
 cat >"${work}/tests.txt" <<'LIST'
-//cmd/rotator:rotator_test
+//:kms-intermediate-rotator_test
 //internal/version:version_test
 LIST
 
@@ -75,19 +75,19 @@ check_flag() { # case name got want
 # flags false, and it is the classification saying so, not a failure.
 expect nothing "" "" ""
 
-# A change under cmd/rotator: its library, binary, test and the zips built
-# from it. Source-file labels (//cmd/rotator:main.go) and a `manual` rule
+# A change to the root package: its library, binary, test and the zips built
+# from it. Source-file labels (//:main.go) and a `manual` rule
 # (//:gazelle) are in no candidate list and are dropped.
 expect rotator "//:gazelle
-//cmd/rotator:main.go
-//cmd/rotator:rotator
-//cmd/rotator:rotator_linux_arm64
-//cmd/rotator:rotator_test
-//cmd/rotator:zip_linux_arm64
-" "//cmd/rotator:rotator
-//cmd/rotator:rotator_linux_arm64
-//cmd/rotator:rotator_test
-//cmd/rotator:zip_linux_arm64" "//cmd/rotator:rotator_test"
+//:main.go
+//:rotator
+//:rotator_linux_arm64
+//:kms-intermediate-rotator_test
+//:zip_linux_arm64
+" "//:rotator
+//:rotator_linux_arm64
+//:kms-intermediate-rotator_test
+//:zip_linux_arm64" "//:kms-intermediate-rotator_test"
 
 # A library with a test: built and tested.
 expect library "//internal/version:version
@@ -101,10 +101,10 @@ expect foreign "@rules_go//go:def.bzl
 //gone:gone
 " "" ""
 
-# An impacted target is matched whole: //cmd/rotator:rotator is not matched
-# by the prefix of //cmd/rotator:rotator_test, and the reverse.
-expect whole "//cmd/rotator:rotator
-" "//cmd/rotator:rotator" ""
+# An impacted target is matched whole: //:rotator is not matched
+# by the prefix of //:rotator_linux_arm64, which it begins.
+expect whole "//:rotator
+" "//:rotator" ""
 
 # classify fails, rather than answering, when a candidate list is unreadable.
 if classify "${work}/rotator/impacted.txt" "${work}/missing.txt" "${work}/tests.txt" "${work}/rotator" 2>/dev/null; then

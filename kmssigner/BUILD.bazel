@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "kmssigner",
     srcs = ["kmssigner.go"],
-    importpath = "github.com/bpalermo/kms-intermediate-rotator/pkg/kmssigner",
+    importpath = "github.com/bpalermo/kms-intermediate-rotator/kmssigner",
     visibility = ["//visibility:public"],
     deps = [
         "@com_github_aws_aws_sdk_go_v2//aws",

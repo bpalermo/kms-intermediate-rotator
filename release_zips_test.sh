@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks each release archive (//cmd/rotator:zip_linux_<arch>): one entry,
+# Checks each release archive (//:zip_linux_<arch>): one entry,
 # `bootstrap`, executable, and an ELF executable of the architecture the
 # archive is named for, with no program interpreter, so static. The arguments
 # are linux_<arch>=<path>.
