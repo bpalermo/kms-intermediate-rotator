@@ -1,0 +1,6 @@
+/bazel-*
+user.bazelrc
+.idea/
+.vscode/
+*.swp
+/.bazel-diff-out/

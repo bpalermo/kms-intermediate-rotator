@@ -1,0 +1,240 @@
+name: release
+
+# A tag v<VERSION> or v<VERSION>-rc.<n> on a commit of main releases that
+# version: the Lambda's two zip archives, a signed checksums.txt and an SBOM,
+# attached to the GitHub Release the tag gets. Who may create such a tag, and
+# that it can never be moved or deleted, is the repository's tag rulesets'.
+on:
+  push:
+    tags: ["v*"]
+
+# The least each job needs; `build` adds the OIDC token it signs with and
+# `release` the write that creates the GitHub Release.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Third-party actions are pinned to commit SHAs, not tags; the version each SHA
+# corresponds to is in the comment beside it. The `build` job holds the OIDC
+# token cosign signs with, so an action a retagged release swapped underneath
+# us could sign with this repository's identity.
+jobs:
+  build:
+    name: build, sign and describe the archives
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Exchanged with Fulcio for a short-lived signing certificate. Keyless:
+      # there is no private key to store or rotate.
+      id-token: write
+    env:
+      # Keep equal to the platform list of //cmd/rotator:BUILD.bazel.
+      PLATFORMS: linux_amd64 linux_arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The version comes from the tags (bazel/workspace_status.sh), and
+          # the tag is checked against main's history: both need all of it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A release is something main has been, never a side branch. ls-remote
+      # rather than the API: the repository is public, so the check needs no
+      # token.
+      - name: Refuse a tag that is not on main
+        run: |
+          set -euo pipefail
+          tip="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | cut -f1)"
+          if [ -z "${tip}" ]; then
+            echo "::error::could not read main's tip" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "${tip}"; then
+            echo "::error::refusing to release ${GITHUB_REF_NAME}: ${GITHUB_SHA} is not a commit of main" >&2
+            exit 1
+          fi
+          echo "releasing ${GITHUB_REF_NAME} from ${GITHUB_SHA}, a commit of main"
+
+      # No version is pinned here: bazelisk reads .bazelversion.
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+          cache-save: false
+
+      # Everything is built before any token is used. The tag must be the
+      # release VERSION names: a tag VERSION does not match is a snapshot, and
+      # its binaries would not say which release they are.
+      - name: Build the archives and cosign
+        run: |
+          set -euo pipefail
+          status="$(bazel/workspace_status.sh)"
+          release="$(sed -n 's/^STABLE_RELEASE_TAG //p' <<<"${status}")"
+          if [ "${release}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::${GITHUB_REF_NAME} is not a release of VERSION $(cat VERSION) (the workspace status says '${release}')" >&2
+            exit 1
+          fi
+          targets=()
+          for platform in ${PLATFORMS}; do
+            targets+=("//cmd/rotator:zip_${platform}")
+          done
+          bazel build --config=ci "${targets[@]}" //bazel/cosign
+
+      # Named kms-intermediate-rotator_<version>_linux_<arch>.zip, the version
+      # without its v, beside checksums.txt in sha256sum's format. Both come
+      # from one stamped build, so they carry one version; the linux/amd64
+      # binary, which this runner can run, must report the tag, or nothing is
+      # signed.
+      - name: Collect the archives and their checksums
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          rm -rf dist
+          mkdir dist
+          for platform in ${PLATFORMS}; do
+            built="$(bazel cquery --config=ci "//cmd/rotator:zip_${platform}" --output=files 2>/dev/null | head -1)"
+            if [ -z "${built}" ] || [ ! -s "${built}" ]; then
+              echo "::error::could not find the archive of //cmd/rotator:zip_${platform} (${built})" >&2
+              exit 1
+            fi
+            install -m 0644 "${built}" "dist/kms-intermediate-rotator_${version}_${platform}.zip"
+          done
+          probe="$(mktemp -d)"
+          unzip -q "dist/kms-intermediate-rotator_${version}_linux_amd64.zip" -d "${probe}"
+          got="$("${probe}/bootstrap" --version)"
+          if [ "${got}" != "kms-intermediate-rotator ${GITHUB_REF_NAME}" ]; then
+            echo "::error::bootstrap reports '${got}', want 'kms-intermediate-rotator ${GITHUB_REF_NAME}'" >&2
+            exit 1
+          fi
+          (cd dist && sha256sum kms-intermediate-rotator_*.zip >checksums.txt)
+          cat dist/checksums.txt
+
+      # The software bill of materials: the Go modules the archives are built
+      # from, read from the checkout, as SPDX JSON.
+      - name: SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: ${{ runner.temp }}/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Name the SBOM after the release
+        run: install -m 0644 "${RUNNER_TEMP}/sbom.spdx.json" "dist/kms-intermediate-rotator_${GITHUB_REF_NAME#v}_sbom.spdx.json"
+
+      # cosign 3 writes the signature, its certificate and the transparency
+      # log entry into one Sigstore bundle. `bazel run` passes the OIDC
+      # request variables through to cosign.
+      - name: Sign checksums.txt
+        env:
+          COSIGN_YES: "true"
+        run: bazel run --config=ci //bazel/cosign -- sign-blob --bundle dist/checksums.txt.sigstore.json dist/checksums.txt
+
+      # As a consumer verifies it: the certificate must be this workflow at
+      # this tag, issued to GitHub Actions; then every archive against it.
+      - name: Verify the signature and the checksums
+        run: |
+          set -euo pipefail
+          bazel run --config=ci //bazel/cosign -- verify-blob dist/checksums.txt \
+            --bundle dist/checksums.txt.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          (cd dist && sha256sum -c checksums.txt)
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The GitHub Release of the tag. A job of its own, so that the job that
+  # builds, which runs Bazel's build tooling, never also holds a token that can
+  # write to the repository.
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+
+      # Exactly the files `build` signed and verified, unchanged on the way: a
+      # release with a file missing, or one more, is refused.
+      - name: Check the files
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          want="$(printf '%s\n' checksums.txt checksums.txt.sigstore.json \
+            "kms-intermediate-rotator_${version}_sbom.spdx.json" \
+            "kms-intermediate-rotator_${version}_linux_amd64.zip" \
+            "kms-intermediate-rotator_${version}_linux_arm64.zip" | sort)"
+          got="$(find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+          if [ "${got}" != "${want}" ]; then
+            echo "::error::the release artifact holds:" >&2
+            echo "${got}" >&2
+            exit 1
+          fi
+          (cd dist && sha256sum --ignore-missing -c checksums.txt)
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          prerelease=()
+          if [[ "${tag}" == *-rc.* ]]; then
+            prerelease=(--prerelease)
+          fi
+          # The changes since the last release, not since the last candidate.
+          # The first release has none before it, and lists everything.
+          previous="$(git tag --list 'v*' --sort=-version:refname --merged "${GITHUB_SHA}" |
+            grep -Ev -- '-rc\.' | grep -vx "${tag}" | head -1 || true)"
+          args=(-f "tag_name=${tag}")
+          if [ -n "${previous}" ]; then
+            args+=(-f "previous_tag_name=${previous}")
+          fi
+          changes="$(gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" "${args[@]}" --jq .body)"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          cat >notes.md <<NOTES
+          ## Install
+
+          The Lambda runs on the \`provided.al2023\` custom runtime. Pick the
+          archive of the function's architecture; it holds one statically
+          linked executable, \`bootstrap\`.
+
+          - \`kms-intermediate-rotator_${tag#v}_linux_arm64.zip\`
+          - \`kms-intermediate-rotator_${tag#v}_linux_amd64.zip\`
+
+          ## Verify
+
+          \`checksums.txt\` is signed by this release's workflow run, and lists
+          the SHA-256 of both archives; the SBOM is
+          \`kms-intermediate-rotator_${tag#v}_sbom.spdx.json\`.
+
+          \`\`\`bash
+          cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json \\
+            --certificate-identity '${identity}' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          sha256sum --ignore-missing -c checksums.txt
+          \`\`\`
+
+          ${changes}
+          NOTES
+          gh release create "${tag}" --repo "${GITHUB_REPOSITORY}" --verify-tag \
+            --title "${tag}" --notes-file notes.md "${prerelease[@]}" \
+            dist/checksums.txt dist/checksums.txt.sigstore.json dist/kms-intermediate-rotator_*

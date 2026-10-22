@@ -1,0 +1,81 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_cross_binary", "go_library", "go_test")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_files")
+load("@rules_pkg//pkg:zip.bzl", "pkg_zip")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+go_library(
+    name = "rotator_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/bpalermo/kms-intermediate-rotator/cmd/rotator",
+    visibility = ["//visibility:private"],
+    deps = ["//internal/version"],
+)
+
+# The Lambda, for the provided.al2023 custom runtime, which starts the
+# executable named `bootstrap`. Pure Go: statically linked, no cgo.
+go_binary(
+    name = "rotator",
+    basename = "bootstrap",
+    embed = [":rotator_lib"],
+    pure = "on",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "rotator_test",
+    srcs = ["main_test.go"],
+    embed = [":rotator_lib"],
+)
+
+# The release archives, one per architecture of the Lambda runtime
+# (release.yml attaches them to the GitHub Release of a v* tag as
+# kms-intermediate-rotator_<version>_linux_<arch>.zip). Each is :rotator built
+# for one platform, stamped like every binary (//internal/version), so a
+# release build reports its tag. Keep the list equal to the one in release.yml.
+[
+    [
+        go_cross_binary(
+            name = "rotator_" + platform,
+            platform = "//bazel/platforms:" + platform,
+            target = ":rotator",
+            visibility = ["//visibility:public"],
+        ),
+        # The file lands in the zip as `bootstrap`, executable.
+        pkg_files(
+            name = "files_" + platform,
+            srcs = [":rotator_" + platform],
+            attributes = pkg_attributes(mode = "0755"),
+            renames = {":rotator_" + platform: "bootstrap"},
+        ),
+        # pkg_zip stamps every entry with a fixed timestamp (1980-01-01) and
+        # sorts nothing it was not given, so the same inputs give the same
+        # bytes. The version is in the file name release.yml gives the zip
+        # and in the binary, not in the archive's metadata.
+        pkg_zip(
+            name = "zip_" + platform,
+            srcs = [":files_" + platform],
+            out = "kms-intermediate-rotator_linux_" + platform.removeprefix("linux_") + ".zip",
+            visibility = ["//visibility:public"],
+        ),
+    ]
+    for platform in [
+        "linux_amd64",
+        "linux_arm64",
+    ]
+]
+
+# Each archive holds one file, `bootstrap`, executable, and that file is a
+# static executable of the architecture the archive is named for.
+sh_test(
+    name = "release_zips_test",
+    size = "small",
+    srcs = ["release_zips_test.sh"],
+    args = [
+        "linux_amd64=$(rootpath :zip_linux_amd64)",
+        "linux_arm64=$(rootpath :zip_linux_arm64)",
+    ],
+    data = [
+        ":zip_linux_amd64",
+        ":zip_linux_arm64",
+    ],
+)

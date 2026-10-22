@@ -1,0 +1,30 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+# The cosign CLI -- only the CLI. @rules_img_signer_cosign//cosign is the
+# official prebuilt release binary, selected per platform, with its sha256
+# pinned in that module's lock (v3.1.2 at 0.0.1). Wrapped here so CI and a
+# workstation run the same checksummed cosign: the release workflow signs and
+# verifies checksums.txt with it. Bumping cosign is bumping that bazel_dep.
+_COSIGN = "@rules_img_signer_cosign//cosign"
+
+exports_files(glob(["*.sh"]))
+
+sh_binary(
+    name = "cosign",
+    srcs = ["cosign.sh"],
+    data = [_COSIGN],
+    env = {"COSIGN_RLOCATIONPATH": "$(rlocationpath %s)" % _COSIGN},
+    visibility = ["//visibility:public"],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)
+
+# Fails until EXPECTED in version_test.sh moves with a bump of the bazel_dep.
+sh_test(
+    name = "version_test",
+    size = "small",
+    srcs = ["version_test.sh"],
+    data = [_COSIGN],
+    env = {"COSIGN_RLOCATIONPATH": "$(rlocationpath %s)" % _COSIGN},
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)
