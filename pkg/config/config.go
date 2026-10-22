@@ -61,6 +61,9 @@ type Secret struct {
 	Validity        Duration        `json:"validity"`
 	MaxPathLen      *int            `json:"max_path_len"`
 	NameConstraints NameConstraints `json:"name_constraints"`
+	// MinRemaining is the least validity a pending intermediate must have
+	// left for testSecret to promote it; default half of Validity.
+	MinRemaining Duration `json:"min_remaining"`
 }
 
 // Subject is the intermediate's subject name.
@@ -156,8 +159,8 @@ func (c *Config) validate() error {
 	if err != nil {
 		return fmt.Errorf("root_certificate: %w", err)
 	}
-	if !root.BasicConstraintsValid || !root.IsCA {
-		return errors.New("root_certificate is not a CA certificate")
+	if err := checkRoot(root); err != nil {
+		return fmt.Errorf("root_certificate: %w", err)
 	}
 	c.Root = root
 	if len(c.Secrets) == 0 {
@@ -170,14 +173,36 @@ func (c *Config) validate() error {
 		if s == nil {
 			return fmt.Errorf("secrets[%s]: empty", arn)
 		}
-		if err := s.validate(); err != nil {
+		if err := s.validate(root); err != nil {
 			return fmt.Errorf("secrets[%s]: %w", arn, err)
 		}
 	}
 	return nil
 }
 
-func (s *Secret) validate() error {
+// checkRoot refuses a root that cannot issue the intermediate.
+func checkRoot(root *x509.Certificate) error {
+	if !root.BasicConstraintsValid || !root.IsCA {
+		return errors.New("not a CA certificate")
+	}
+	if root.KeyUsage != 0 && root.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return errors.New("its key usage does not include keyCertSign")
+	}
+	if root.MaxPathLenZero || root.MaxPathLen == 0 {
+		return errors.New("its path length is 0: it can issue no intermediate CA")
+	}
+	return nil
+}
+
+// rootPathLen is the path length constraint of root, or -1 when it has none.
+func rootPathLen(root *x509.Certificate) int {
+	if root.MaxPathLen > 0 {
+		return root.MaxPathLen
+	}
+	return -1
+}
+
+func (s *Secret) validate(root *x509.Certificate) error {
 	if strings.TrimSpace(s.Subject.CommonName) == "" {
 		return errors.New("subject.common_name is required")
 	}
@@ -196,6 +221,17 @@ func (s *Secret) validate() error {
 	}
 	if *s.MaxPathLen < 0 {
 		return fmt.Errorf("max_path_len %d is negative", *s.MaxPathLen)
+	}
+	// The intermediate is one CA below the root; its own path length must
+	// fit in what is left.
+	if n := rootPathLen(root); n >= 0 && *s.MaxPathLen > n-1 {
+		return fmt.Errorf("max_path_len %d does not fit under the root's path length %d (at most %d)", *s.MaxPathLen, n, n-1)
+	}
+	if s.MinRemaining == 0 {
+		s.MinRemaining = s.Validity / 2
+	}
+	if s.MinRemaining > s.Validity {
+		return fmt.Errorf("min_remaining %s is longer than validity %s", time.Duration(s.MinRemaining), time.Duration(s.Validity))
 	}
 	return s.NameConstraints.validate()
 }
@@ -228,9 +264,10 @@ func (s *Secret) Profile() intermediate.Profile {
 			Province:           s.Subject.Province,
 			Locality:           s.Subject.Locality,
 		},
-		KeyType:    intermediate.KeyType(s.KeyType),
-		Validity:   time.Duration(s.Validity),
-		MaxPathLen: *s.MaxPathLen,
+		KeyType:      intermediate.KeyType(s.KeyType),
+		Validity:     time.Duration(s.Validity),
+		MaxPathLen:   *s.MaxPathLen,
+		MinRemaining: time.Duration(s.MinRemaining),
 		NameConstraints: intermediate.NameConstraints{
 			PermittedURIDomains: s.NameConstraints.PermittedURIDomains,
 			ExcludedURIDomains:  s.NameConstraints.ExcludedURIDomains,

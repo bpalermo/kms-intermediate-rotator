@@ -40,6 +40,13 @@ func NewKey(t testing.TB, curve elliptic.Curve) crypto.Signer {
 // lifetime, with path length 2 and a SubjectKeyId.
 func NewRoot(t testing.TB, key crypto.Signer, lifetime time.Duration) *Root {
 	t.Helper()
+	return NewRootWith(t, key, lifetime, nil)
+}
+
+// NewRootWith is NewRoot with change applied to the template before it is
+// signed.
+func NewRootWith(t testing.TB, key crypto.Signer, lifetime time.Duration, change func(*x509.Certificate)) *Root {
+	t.Helper()
 	now := time.Now()
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
@@ -50,6 +57,9 @@ func NewRoot(t testing.TB, key crypto.Signer, lifetime time.Duration) *Root {
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		MaxPathLen:            2,
+	}
+	if change != nil {
+		change(tmpl)
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
 	if err != nil {

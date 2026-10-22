@@ -16,8 +16,10 @@ or x86_64.
 ## Rotation flow
 
 Secrets Manager invokes the function four times per rotation, with
-`{"SecretId", "ClientRequestToken", "Step"}` (an optional `RotationToken` is
-accepted and ignored). Before every step, as the AWS rotation templates do,
+`{"SecretId", "ClientRequestToken", "Step"}` and, when the function rotates
+through an assumed role or across accounts, a `RotationToken`, which is
+passed on to `PutSecretValue` (and never logged). Before every step, as the
+AWS rotation templates do,
 the function checks that the secret is in its configuration (by full ARN; a
 `SecretId` given as a name is resolved with `DescribeSecret`), that rotation
 is enabled on it and that the token is one of its versions. If that version
@@ -27,15 +29,33 @@ is already `AWSCURRENT` the step succeeds and does nothing; if it is not
 1. **createSecret**: if the `AWSPENDING` version of the token already has a
    value (a retry), it returns without signing again. Otherwise it generates
    a key, builds the certificate from the secret's configuration, signs it
-   with KMS (`Sign`, `MessageType: DIGEST`), checks the signature against the
-   root, and writes the secret with `PutSecretValue` (the token,
-   `VersionStages: [AWSPENDING]`).
+   with KMS (`Sign`, `MessageType: DIGEST`, on the key ARN `GetPublicKey`
+   resolved `kms_key_id` to at start), checks the signature against the
+   root and that a chain as deep as its path length allows verifies, and
+   writes the secret with `PutSecretValue` (the token,
+   `VersionStages: [AWSPENDING]`). If a concurrent invocation for the same
+   token stored its version first, that one is kept and the step succeeds.
 2. **setSecret**: nothing; there is no service to configure.
 3. **testSecret**: reads `AWSPENDING` and checks it as a reader would (format
    v1, key matches cert, cert verifies to the root), that its root is the
    configured one, that subject, basic constraints, path length, key usage,
-   name constraints and key type equal the configuration, and that it is
-   valid until at least now + `validity` − 24h.
+   name constraints and key type equal the configuration, that a throwaway
+   chain as deep as its path length allows (sub-CAs and a leaf, made in
+   memory) verifies to the root, and its lifetime:
+   - measured from its issuance (`NotBefore` + 5m), it was given the
+     configured `validity` (or up to the root's `NotAfter`, if sooner);
+   - it has at least `min_remaining` (default half the validity) left now.
+
+   So a rotation retried days later with the same `AWSPENDING` version
+   still passes, and one whose pending version is mostly used up fails (see
+   [Recovering a stuck rotation](#recovering-a-stuck-rotation)).
+
+   A `testSecret` with nothing to test (the token is not a version of the
+   secret, or its `AWSPENDING` version has no value) is the configuration
+   test Secrets Manager runs when rotation is set up without rotating
+   immediately: it succeeds, since the configuration and the KMS key were
+   checked at start, and is logged as a configuration test. A pending
+   version with a value is always tested in full.
 4. **finishSecret**: moves `AWSCURRENT` to the token with
    `UpdateSecretVersionStage`, removing it from the version that had it
    (Secrets Manager then labels that one `AWSPREVIOUS`).
@@ -54,16 +74,49 @@ Nothing in it comes from the event; everything comes from the configuration:
 - basic constraints `CA:TRUE` with the configured path length (0 included),
   critical; key usage `keyCertSign | cRLSign`, critical;
 - name constraints, critical, when any are configured: permitted and
-  excluded URI domains and DNS domains, with the semantics of Go's
-  `crypto/x509` (`example.org` matches that host, `.example.org` the hosts
-  below it);
+  excluded URI domains and DNS domains (see below);
 - subject key identifier = SHA-1 of the new public key (RFC 5280 method 1);
   authority key identifier = the root's subject key identifier.
 
-Because testSecret wants the full validity minus a day, rotation starts to
-fail once the root has less than `validity` − 24h left: the current
-intermediate stays in place and keeps working until it expires. Alarm on
-rotation failures and renew the root before then.
+### Name constraints: verifiers differ
+
+A domain without a leading dot does not mean the same everywhere:
+
+| Constraint | Go `crypto/x509` (URI and DNS) | RFC 5280, OpenSSL, BoringSSL (URI) |
+| --- | --- | --- |
+| `example.org` | `example.org` **and every host below it** | `example.org` only |
+| `.example.org` | hosts below `example.org`, not `example.org` | hosts below `example.org` |
+
+So `permitted_uri_domains: ["example.org"]` alone lets a Go verifier accept
+`spiffe://sub.example.org`. To allow exactly one host (a SPIFFE trust
+domain, for instance) in every stack, pair the two:
+
+```json
+"name_constraints": {
+  "permitted_uri_domains": ["example.org"],
+  "excluded_uri_domains": [".example.org"]
+}
+```
+
+For DNS constraints all of them read `example.org` as the domain and its
+subdomains.
+
+### Path length and the root
+
+The intermediate is one CA below the root. At start the configuration is
+refused if the root's path length is 0, if a secret's `max_path_len` does
+not fit under it (`max_path_len` ≤ root path length − 1), or if the root has
+a key usage without `keyCertSign`. createSecret and testSecret also verify a
+chain of the full depth, so an intermediate whose chains could not verify is
+never promoted.
+
+### The root's expiry
+
+`NotAfter` is capped at the root's, and testSecret wants `min_remaining`
+left, so rotation starts to fail once the root has less than
+`min_remaining` left: the current intermediate stays in place and keeps
+working until it expires. Alarm on rotation failures and renew the root
+before then.
 
 ## Configuration
 
@@ -105,10 +158,31 @@ Exactly one of these environment variables must be set:
 | `subject` | `common_name` (required), `organization`, `organizational_unit`, `country`, `province`, `locality` | |
 | `key_type` | the intermediate's key: `ec-p256`, `ec-p384`, `rsa-2048`, `rsa-4096` | `ec-p256` |
 | `validity` | a Go duration (`h`, `m`, `s`), positive | `2160h` (90 days) |
-| `max_path_len` | path length constraint, 0 or more | `1` |
+| `max_path_len` | path length constraint, 0 or more, at most the root's path length − 1 | `1` |
+| `min_remaining` | a Go duration: the least validity a pending intermediate must have left for testSecret to promote it; at most `validity` | half of `validity` |
 | `name_constraints` | `permitted_uri_domains`, `excluded_uri_domains`, `permitted_dns_domains`, `excluded_dns_domains` | none |
 
 Unknown fields are errors, so a misspelt setting does not go unnoticed.
+
+## Recovering a stuck rotation
+
+A version's value cannot change, and Secrets Manager retries a failed
+rotation with the same `AWSPENDING` version. When testSecret rejects that
+value (too little validity left, a root that is no longer the configured
+one, a configuration changed since it was issued), every retry fails the
+same way, and the error says so. Take the label off the version, and the
+next rotation starts afresh with a new token:
+
+```bash
+aws secretsmanager update-secret-version-stage \
+  --secret-id arn:aws:secretsmanager:us-east-1:111122223333:secret:example-AbCdEf \
+  --version-stage AWSPENDING \
+  --remove-from-version-id <the version in the error>
+aws secretsmanager rotate-secret \
+  --secret-id arn:aws:secretsmanager:us-east-1:111122223333:secret:example-AbCdEf
+```
+
+`AWSCURRENT` is untouched throughout: readers keep the current intermediate.
 
 ## IAM
 

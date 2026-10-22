@@ -97,9 +97,16 @@ func New(ctx context.Context, client Client, keyID, signingAlgorithm string, exp
 	if err != nil {
 		return nil, err
 	}
+	// Sign with the key ARN GetPublicKey resolved keyID to, so that an
+	// alias is resolved once, at start, and cannot move to another key in
+	// between.
+	resolved := aws.ToString(out.KeyId)
+	if resolved == "" {
+		resolved = keyID
+	}
 	return &Signer{
 		client:    client,
-		keyID:     keyID,
+		keyID:     resolved,
 		public:    pub,
 		algorithm: alg,
 		params:    algorithms[alg],
@@ -130,6 +137,9 @@ func (s *Signer) WithContext(ctx context.Context) *Signer {
 	c.ctx = ctx
 	return &c
 }
+
+// KeyID is the key ARN the signer signs with, as GetPublicKey returned it.
+func (s *Signer) KeyID() string { return s.keyID }
 
 // Public returns the KMS key's public key.
 func (s *Signer) Public() crypto.PublicKey { return s.public }

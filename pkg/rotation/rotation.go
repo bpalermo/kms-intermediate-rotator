@@ -40,17 +40,14 @@ const (
 	StagePending = "AWSPENDING"
 )
 
-// ValiditySlack is how much shorter than the configured validity a pending
-// intermediate may be valid for and still pass testSecret.
-const ValiditySlack = 24 * time.Hour
-
 // Event is the input Secrets Manager invokes a rotation function with.
 type Event struct {
 	SecretID           string `json:"SecretId"`
 	ClientRequestToken string `json:"ClientRequestToken"`
 	Step               string `json:"Step"`
-	// RotationToken is sent for cross-account rotation; it is accepted and
-	// ignored.
+	// RotationToken identifies the rotation when the function rotates
+	// through an assumed role or across accounts; when set it is passed on
+	// to PutSecretValue. It is sensitive and never logged.
 	RotationToken string `json:"RotationToken,omitempty"`
 }
 
@@ -75,18 +72,20 @@ type Rotator struct {
 
 // target is the secret an event is for.
 type target struct {
-	arn     string
-	token   string
-	secret  *config.Secret
-	profile intermediate.Profile
-	desc    *secretsmanager.DescribeSecretOutput
+	arn           string
+	token         string
+	rotationToken string
+	secret        *config.Secret
+	profile       intermediate.Profile
+	desc          *secretsmanager.DescribeSecretOutput
 }
 
 // Handle runs one rotation step. It applies the preconditions the AWS
 // rotation templates apply to every step: the secret is configured here
 // and has rotation enabled, the token is a version of it, a token that is
 // already AWSCURRENT is a success with nothing to do, and a token that is
-// not AWSPENDING is an error.
+// not AWSPENDING is an error. The one exception: a testSecret for a token
+// that is not a version is a configuration test, and succeeds.
 func (r *Rotator) Handle(ctx context.Context, ev Event) error {
 	if ev.SecretID == "" || ev.ClientRequestToken == "" {
 		return errors.New("the event needs a SecretId and a ClientRequestToken")
@@ -104,7 +103,13 @@ func (r *Rotator) Handle(ctx context.Context, ev Event) error {
 		return err
 	}
 	log := r.logger().With("secret_arn", t.arn, "step", ev.Step, "token", t.token)
-	stages := t.desc.VersionIdsToStages[t.token]
+	stages, isVersion := t.desc.VersionIdsToStages[t.token]
+	if !isVersion {
+		if ev.Step == StepTest {
+			return r.configurationTest(log, "the token is not a version of the secret")
+		}
+		return fmt.Errorf("secret %s has no version %s", t.arn, t.token)
+	}
 	if slices.Contains(stages, StageCurrent) {
 		log.Info("the version is already AWSCURRENT; nothing to do")
 		return nil
@@ -116,7 +121,7 @@ func (r *Rotator) Handle(ctx context.Context, ev Event) error {
 	case StepCreate:
 		return r.createSecret(ctx, t, log)
 	case StepTest:
-		return r.testSecret(ctx, t)
+		return r.testSecret(ctx, t, log)
 	case StepFinish:
 		return r.finishSecret(ctx, t, log)
 	}
@@ -136,14 +141,15 @@ func (r *Rotator) target(ctx context.Context, ev Event) (*target, error) {
 	if !aws.ToBool(desc.RotationEnabled) {
 		return nil, fmt.Errorf("secret %s does not have rotation enabled", arn)
 	}
-	if _, ok := desc.VersionIdsToStages[ev.ClientRequestToken]; !ok {
-		return nil, fmt.Errorf("secret %s has no version %s", arn, ev.ClientRequestToken)
-	}
-	return &target{arn: arn, token: ev.ClientRequestToken, secret: sc, profile: sc.Profile(), desc: desc}, nil
+	return &target{
+		arn: arn, token: ev.ClientRequestToken, rotationToken: ev.RotationToken,
+		secret: sc, profile: sc.Profile(), desc: desc,
+	}, nil
 }
 
 // createSecret issues a new intermediate and stores it as the AWSPENDING
-// version of the token, unless that version already has a value (a retry).
+// version of the token, unless that version already has a value (a retry,
+// or a concurrent invocation that got there first).
 func (r *Rotator) createSecret(ctx context.Context, t *target, log *slog.Logger) error {
 	if _, err := r.pending(ctx, t); err == nil {
 		log.Info("the pending version already has a value; not issuing again")
@@ -152,31 +158,27 @@ func (r *Rotator) createSecret(ctx context.Context, t *target, log *slog.Logger)
 		return fmt.Errorf("read the pending version: %w", err)
 	}
 
-	key, err := intermediate.GenerateKey(t.profile.KeyType)
+	cert, value, err := r.issue(ctx, t)
 	if err != nil {
 		return err
 	}
-	signer := r.Signer.WithContext(ctx)
-	root := r.Config.Root
-	cert, err := intermediate.Issue(t.profile, key.Public(), root, signer, signer.SignatureAlgorithm(), r.now())
-	if err != nil {
-		return err
-	}
-	b := &secretformat.Bundle{Cert: cert, Key: key, Root: root}
-	if err := b.Verify(r.now()); err != nil {
-		return fmt.Errorf("the new intermediate: %w", err)
-	}
-	value, err := secretformat.Encode(b)
-	if err != nil {
-		return err
-	}
-	_, err = r.SecretsManager.PutSecretValue(ctx, &secretsmanager.PutSecretValueInput{
+	in := &secretsmanager.PutSecretValueInput{
 		SecretId:           aws.String(t.arn),
 		ClientRequestToken: aws.String(t.token),
 		SecretString:       aws.String(value),
 		VersionStages:      []string{StagePending},
-	})
-	if err != nil {
+	}
+	if t.rotationToken != "" {
+		in.RotationToken = aws.String(t.rotationToken)
+	}
+	if _, err := r.SecretsManager.PutSecretValue(ctx, in); err != nil {
+		var exists *types.ResourceExistsException
+		if errors.As(err, &exists) {
+			if _, err := r.pending(ctx, t); err == nil {
+				log.Info("another invocation stored the pending version first; discarding this one")
+				return nil
+			}
+		}
 		return fmt.Errorf("put the pending version: %w", err)
 	}
 	log.Info("issued intermediate certificate",
@@ -187,24 +189,82 @@ func (r *Rotator) createSecret(ctx context.Context, t *target, log *slog.Logger)
 	return nil
 }
 
+// issue makes a new key and intermediate, checks them, and returns the
+// certificate and the v1 secret value.
+func (r *Rotator) issue(ctx context.Context, t *target) (*x509.Certificate, string, error) {
+	key, err := intermediate.GenerateKey(t.profile.KeyType)
+	if err != nil {
+		return nil, "", err
+	}
+	signer := r.Signer.WithContext(ctx)
+	root := r.Config.Root
+	now := r.now()
+	cert, err := intermediate.Issue(t.profile, key.Public(), root, signer, signer.SignatureAlgorithm(), now)
+	if err != nil {
+		return nil, "", err
+	}
+	b := &secretformat.Bundle{Cert: cert, Key: key, Root: root}
+	if err := b.Verify(now); err != nil {
+		return nil, "", fmt.Errorf("the new intermediate: %w", err)
+	}
+	if err := intermediate.VerifyDepth(cert, key, root, now); err != nil {
+		return nil, "", fmt.Errorf("the new intermediate: %w", err)
+	}
+	value, err := secretformat.Encode(b)
+	if err != nil {
+		return nil, "", err
+	}
+	return cert, value, nil
+}
+
 // testSecret checks the AWSPENDING version: it is format v1, its key
-// matches its cert, the cert verifies to the configured root, and the cert
-// is what createSecret would issue now.
-func (r *Rotator) testSecret(ctx context.Context, t *target) error {
+// matches its cert, the cert verifies to the configured root (also through
+// a chain as deep as its path length allows), it is what createSecret
+// issues, and it has enough validity left.
+//
+// A token whose AWSPENDING version has no value is a configuration test
+// (rotation set up without rotating immediately runs testSecret alone) and
+// succeeds: the configuration and the KMS key were checked at start.
+func (r *Rotator) testSecret(ctx context.Context, t *target, log *slog.Logger) error {
 	out, err := r.pending(ctx, t)
+	if isNotFound(err) {
+		return r.configurationTest(log, "the pending version has no value")
+	}
 	if err != nil {
 		return fmt.Errorf("read the pending version: %w", err)
 	}
-	b, err := secretformat.Decode(aws.ToString(out.SecretString), r.now())
+	if err := r.validatePending(aws.ToString(out.SecretString), t); err != nil {
+		// A version cannot change: retrying will not help.
+		return fmt.Errorf("pending version %s of %s: %w; it can never pass, so remove AWSPENDING from it "+
+			"(aws secretsmanager update-secret-version-stage --secret-id %s --version-stage AWSPENDING --remove-from-version-id %s) "+
+			"and rotate again", t.token, t.arn, err, t.arn, t.token)
+	}
+	log.Info("the pending version is valid")
+	return nil
+}
+
+func (r *Rotator) validatePending(value string, t *target) error {
+	now := r.now()
+	b, err := secretformat.Decode(value, now)
 	if err != nil {
-		return fmt.Errorf("pending version of %s: %w", t.arn, err)
+		return err
 	}
-	if !b.Root.Equal(r.Config.Root) {
-		return fmt.Errorf("pending version of %s: the root is not the configured root", t.arn)
+	root := r.Config.Root
+	if !b.Root.Equal(root) {
+		return errors.New("its root is not the configured root")
 	}
-	if err := intermediate.Check(b.Cert, t.profile, r.now(), ValiditySlack); err != nil {
-		return fmt.Errorf("pending version of %s: %w", t.arn, err)
+	if err := intermediate.Check(b.Cert, t.profile); err != nil {
+		return err
 	}
+	if err := intermediate.CheckLifetime(b.Cert, t.profile, root, now); err != nil {
+		return err
+	}
+	return intermediate.VerifyDepth(b.Cert, b.Key, root, now)
+}
+
+// configurationTest is testSecret without a pending value to test.
+func (r *Rotator) configurationTest(log *slog.Logger, why string) error {
+	log.Info("configuration test: nothing to validate, the configuration and the KMS key were checked at start", "reason", why)
 	return nil
 }
 

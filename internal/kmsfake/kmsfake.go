@@ -21,19 +21,23 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 )
 
-// KMS holds one key, known by KeyID.
+// KMS holds one key, known by KeyID (an alias, say) and by KeyARN.
 type KMS struct {
-	KeyID string
-	Key   crypto.Signer
+	KeyID  string
+	KeyARN string
+	Key    crypto.Signer
 
 	mu    sync.Mutex
 	signs int
 	last  *kms.SignInput
 }
 
-// New returns a fake holding key under keyID.
+// KeyARN is the ARN the fake gives its key.
+const KeyARN = "arn:aws:kms:us-east-1:111122223333:key/00000000-0000-0000-0000-000000000000"
+
+// New returns a fake holding key under keyID and KeyARN.
 func New(keyID string, key crypto.Signer) *KMS {
-	return &KMS{KeyID: keyID, Key: key}
+	return &KMS{KeyID: keyID, KeyARN: KeyARN, Key: key}
 }
 
 // Signs is how many successful Sign calls the fake has answered.
@@ -74,7 +78,7 @@ func (f *KMS) spec() (types.KeySpec, []types.SigningAlgorithmSpec, error) {
 }
 
 func (f *KMS) checkKey(id *string) error {
-	if aws.ToString(id) != f.KeyID {
+	if s := aws.ToString(id); s != f.KeyID && s != f.KeyARN {
 		return &types.NotFoundException{Message: aws.String("kmsfake: no key " + aws.ToString(id))}
 	}
 	return nil
@@ -94,7 +98,7 @@ func (f *KMS) GetPublicKey(_ context.Context, in *kms.GetPublicKeyInput, _ ...fu
 		return nil, err
 	}
 	return &kms.GetPublicKeyOutput{
-		KeyId:             aws.String(f.KeyID),
+		KeyId:             aws.String(f.KeyARN),
 		KeySpec:           spec,
 		KeyUsage:          types.KeyUsageTypeSignVerify,
 		PublicKey:         der,
@@ -149,5 +153,5 @@ func (f *KMS) Sign(_ context.Context, in *kms.SignInput, _ ...func(*kms.Options)
 	f.signs++
 	f.last = in
 	f.mu.Unlock()
-	return &kms.SignOutput{KeyId: aws.String(f.KeyID), Signature: sig, SigningAlgorithm: in.SigningAlgorithm}, nil
+	return &kms.SignOutput{KeyId: aws.String(f.KeyARN), Signature: sig, SigningAlgorithm: in.SigningAlgorithm}, nil
 }

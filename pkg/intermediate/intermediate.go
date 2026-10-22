@@ -25,8 +25,13 @@ import (
 const Backdate = 5 * time.Minute
 
 // NameConstraints are the name constraints written into the intermediate.
-// URI domains follow Go's crypto/x509 semantics: "example.org" matches that
-// host only, ".example.org" any host below it.
+//
+// Verifiers disagree on a domain without a leading dot. Go's crypto/x509
+// treats "example.org" as that host and every host below it, for URI and DNS
+// constraints alike, and ".example.org" as the hosts below it only. RFC 5280
+// (and OpenSSL, BoringSSL) read a URI constraint "example.org" as that host
+// only. To permit exactly one host (a SPIFFE trust domain, say) in both,
+// permit "example.org" and exclude ".example.org".
 type NameConstraints struct {
 	PermittedURIDomains []string
 	ExcludedURIDomains  []string
@@ -53,6 +58,17 @@ type Profile struct {
 	// (written with MaxPathLenZero), never "unset".
 	MaxPathLen      int
 	NameConstraints NameConstraints
+	// MinRemaining is the least validity an intermediate may have left to
+	// be promoted (CheckLifetime); 0 is half of Validity.
+	MinRemaining time.Duration
+}
+
+// minRemaining is p.MinRemaining with its default.
+func (p Profile) minRemaining() time.Duration {
+	if p.MinRemaining > 0 {
+		return p.MinRemaining
+	}
+	return p.Validity / 2
 }
 
 // Template returns the certificate template for a new intermediate with the
@@ -176,10 +192,10 @@ var (
 
 // Check reports whether cert is what Issue makes from p: the subject, the CA
 // basic constraints and path length, the key usage and the name constraints
-// equal the profile, with the criticality Issue gives them, the key is of the
-// profile's type, and cert is valid until at least now + Validity - slack.
-// It does not check the signature; see the secretformat package for that.
-func Check(cert *x509.Certificate, p Profile, now time.Time, slack time.Duration) error {
+// equal the profile, with the criticality Issue gives them, and the key is
+// of the profile's type. It checks neither the validity window (see
+// CheckLifetime) nor the signature (see the secretformat package).
+func Check(cert *x509.Certificate, p Profile) error {
 	checks := []func(*x509.Certificate, Profile) error{
 		checkSubject,
 		checkKeyType,
@@ -192,12 +208,108 @@ func Check(cert *x509.Certificate, p Profile, now time.Time, slack time.Duration
 			return err
 		}
 	}
-	// Certificate times have a precision of one second.
-	if earliest := now.Add(p.Validity - slack).Truncate(time.Second); cert.NotAfter.Before(earliest) {
-		return fmt.Errorf("not after %s is before %s (validity %s)",
-			cert.NotAfter.UTC().Format(time.RFC3339), earliest.UTC().Format(time.RFC3339), p.Validity)
+	return nil
+}
+
+// LifetimeSlack is how much shorter than expected the lifetime of an
+// intermediate may be (CheckLifetime): certificate times have a precision
+// of one second.
+const LifetimeSlack = time.Minute
+
+// ErrTooLittleLeft is returned (wrapped) by CheckLifetime for an
+// intermediate that was issued right but has too little validity left to be
+// worth promoting.
+var ErrTooLittleLeft = errors.New("too little validity left")
+
+// CheckLifetime reports whether cert, issued from p under root, got the
+// lifetime Issue gives at issuance (Validity, or up to the root's NotAfter
+// when that is sooner) and still has at least p.MinRemaining (default half
+// of Validity) left at now. The lifetime is measured from the issuance time
+// (NotBefore + Backdate), so an intermediate issued some time ago passes as
+// long as enough of it is left.
+func CheckLifetime(cert *x509.Certificate, p Profile, root *x509.Certificate, now time.Time) error {
+	issued := cert.NotBefore.Add(Backdate)
+	want := p.Validity
+	if untilRoot := root.NotAfter.Sub(issued); untilRoot < want {
+		want = untilRoot
+	}
+	if got := cert.NotAfter.Sub(issued); got < want-LifetimeSlack {
+		return fmt.Errorf("issued at %s for %s, want %s (validity %s, capped at the root's not after)",
+			issued.UTC().Format(time.RFC3339), got, want, p.Validity)
+	}
+	if left := cert.NotAfter.Sub(now); left < p.minRemaining() {
+		return fmt.Errorf("%w: not after %s leaves %s, below the minimum of %s",
+			ErrTooLittleLeft, cert.NotAfter.UTC().Format(time.RFC3339), left.Round(time.Second), p.minRemaining())
 	}
 	return nil
+}
+
+// VerifyDepth proves that cert, with its private key key, can issue as deep
+// a chain as its path length allows and still verify to root: it issues,
+// in memory, MaxPathLen throwaway sub-CAs one under the other and a leaf
+// under the last, and verifies the leaf to root at now. A path length the
+// root does not leave room for fails here, though cert alone verifies.
+func VerifyDepth(cert *x509.Certificate, key crypto.Signer, root *x509.Certificate, now time.Time) error {
+	depth := max(cert.MaxPathLen, 0)
+	intermediates := x509.NewCertPool()
+	intermediates.AddCert(cert)
+	issuer, issuerKey := cert, key
+	for i := 0; i <= depth; i++ {
+		c, k, err := probe(issuer, issuerKey, i < depth, now)
+		if err != nil {
+			return fmt.Errorf("path length probe: %w", err)
+		}
+		if c.IsCA {
+			intermediates.AddCert(c)
+		}
+		issuer, issuerKey = c, k
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+	_, err := issuer.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: intermediates,
+		CurrentTime:   now,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	})
+	if err != nil {
+		return fmt.Errorf("a chain %d CA(s) deep under the intermediate (its path length) does not verify to the root: %w", depth, err)
+	}
+	return nil
+}
+
+// probe issues a throwaway certificate under issuer: a CA without a path
+// length constraint, or a leaf without names.
+func probe(issuer *x509.Certificate, issuerKey crypto.Signer, ca bool, now time.Time) (*x509.Certificate, crypto.Signer, error) {
+	key, err := GenerateKey(KeyTypeECP256)
+	if err != nil {
+		return nil, nil, err
+	}
+	serial, err := SerialNumber(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	notAfter := now.Add(time.Hour)
+	if issuer.NotAfter.Before(notAfter) {
+		notAfter = issuer.NotAfter
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "path length probe"},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	if ca {
+		tmpl.BasicConstraintsValid, tmpl.IsCA, tmpl.MaxPathLen = true, true, -1
+		tmpl.KeyUsage = x509.KeyUsageCertSign
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, issuer, key.Public(), issuerKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	c, err := x509.ParseCertificate(der)
+	return c, key, err
 }
 
 func checkSubject(cert *x509.Certificate, p Profile) error {

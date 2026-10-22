@@ -24,7 +24,11 @@ type fakeSM struct {
 	stages   map[string][]string // version -> labels
 
 	puts    int
+	lastPut *secretsmanager.PutSecretValueInput
 	updates []secretsmanager.UpdateSecretVersionStageInput
+	// beforePut, when set, runs at the start of PutSecretValue, outside the
+	// lock: another writer racing this one.
+	beforePut func()
 }
 
 func newFakeSM(arn, name string) *fakeSM {
@@ -84,11 +88,15 @@ func (f *fakeSM) GetSecretValue(_ context.Context, in *secretsmanager.GetSecretV
 }
 
 func (f *fakeSM) PutSecretValue(_ context.Context, in *secretsmanager.PutSecretValueInput, _ ...func(*secretsmanager.Options)) (*secretsmanager.PutSecretValueOutput, error) {
+	if f.beforePut != nil {
+		f.beforePut()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.check(in.SecretId); err != nil {
 		return nil, err
 	}
+	f.lastPut = in
 	id := aws.ToString(in.ClientRequestToken)
 	if v := f.values[id]; v != nil {
 		if *v != aws.ToString(in.SecretString) {

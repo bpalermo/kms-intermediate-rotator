@@ -3,6 +3,7 @@ package config_test
 import (
 	"context"
 	"crypto/elliptic"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -119,7 +120,8 @@ func TestParseDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := cfg.Secrets[secretARN].Profile()
-	if p.KeyType != intermediate.KeyTypeECP256 || p.Validity != 2160*time.Hour || p.MaxPathLen != 1 || !p.NameConstraints.Empty() {
+	if p.KeyType != intermediate.KeyTypeECP256 || p.Validity != 2160*time.Hour || p.MaxPathLen != 1 || !p.NameConstraints.Empty() ||
+		p.MinRemaining != 1080*time.Hour {
 		t.Fatalf("defaults %+v", p)
 	}
 }
@@ -153,6 +155,9 @@ func TestParseRejects(t *testing.T) {
 		{"zero duration", func(_, s map[string]any) { s["validity"] = "0s" }, "not positive"},
 		{"negative duration", func(_, s map[string]any) { s["validity"] = "-1h" }, "not positive"},
 		{"numeric duration", func(_, s map[string]any) { s["validity"] = 3600 }, "duration"},
+		{"invalid min_remaining", func(_, s map[string]any) { s["min_remaining"] = "soon" }, "duration"},
+		{"min_remaining over validity", func(_, s map[string]any) { s["min_remaining"] = "721h" }, "longer than validity"},
+		{"path length too long for the root", func(_, s map[string]any) { s["max_path_len"] = 2 }, "does not fit under the root's path length 2"},
 		{"unknown key type", func(_, s map[string]any) { s["key_type"] = "ed25519" }, "unknown key_type"},
 		{"negative path length", func(_, s map[string]any) { s["max_path_len"] = -1 }, "max_path_len"},
 		{"no common name", func(_, s map[string]any) { s["subject"] = map[string]any{} }, "common_name"},
@@ -197,6 +202,40 @@ func TestLookup(t *testing.T) {
 			}
 			if _, _, ok := cfg.Lookup(tc.arn); ok != tc.want {
 				t.Fatalf("Lookup(%s) = %t, want %t", tc.arn, ok, tc.want)
+			}
+		})
+	}
+}
+
+// The root must leave room for the intermediate and its path length.
+func TestParseRootPathLength(t *testing.T) {
+	root := func(change func(*x509.Certificate)) string {
+		return testca.NewRootWith(t, testca.NewKey(t, elliptic.P384()), time.Hour, change).PEM()
+	}
+	pathLen := func(n int) func(*x509.Certificate) {
+		return func(c *x509.Certificate) { c.MaxPathLen, c.MaxPathLenZero = n, n == 0 }
+	}
+	for _, tc := range []struct {
+		name       string
+		root       string
+		maxPathLen int
+		wantErr    string // empty: valid
+	}{
+		{"root 0", root(pathLen(0)), 0, "can issue no intermediate CA"},
+		{"root 1, intermediate 1", root(pathLen(1)), 1, "does not fit"},
+		{"root 1, intermediate 0", root(pathLen(1)), 0, ""},
+		{"root 3, intermediate 2", root(pathLen(3)), 2, ""},
+		{"unconstrained root", root(pathLen(-1)), 5, ""},
+		{"root without keyCertSign", root(func(c *x509.Certificate) { c.KeyUsage = x509.KeyUsageDigitalSignature }), 0, "keyCertSign"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Parse([]byte(document(t, tc.root, func(_, s map[string]any) { s["max_path_len"] = tc.maxPathLen })))
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Parse = %v, want an error with %q", err, tc.wantErr)
 			}
 		})
 	}

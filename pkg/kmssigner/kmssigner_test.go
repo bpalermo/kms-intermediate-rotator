@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/kms/types"
 
 	"github.com/bpalermo/kms-intermediate-rotator/internal/kmsfake"
@@ -66,8 +67,10 @@ func TestSignDigest(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if in := fake.LastSign(); in.MessageType != types.MessageTypeDigest || in.SigningAlgorithm != tc.wantAlg {
-				t.Fatalf("KMS Sign called with %s/%s", in.MessageType, in.SigningAlgorithm)
+			// The alias is resolved once, by GetPublicKey: Sign names the key ARN.
+			if in := fake.LastSign(); in.MessageType != types.MessageTypeDigest || in.SigningAlgorithm != tc.wantAlg ||
+				aws.ToString(in.KeyId) != kmsfake.KeyARN || s.KeyID() != kmsfake.KeyARN {
+				t.Fatalf("KMS Sign called with %s/%s on %s", in.MessageType, in.SigningAlgorithm, aws.ToString(in.KeyId))
 			}
 			if !verify(t, s.Public(), tc.hash, d, sig) {
 				t.Fatal("signature does not verify")

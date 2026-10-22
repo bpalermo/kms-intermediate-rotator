@@ -38,6 +38,8 @@ type env struct {
 	cfg     *config.Config
 	rotator *rotation.Rotator
 	logs    *bytes.Buffer
+	// clock is the rotator's time; tests move it forward.
+	clock time.Time
 }
 
 func newEnv(t *testing.T) *env {
@@ -72,8 +74,8 @@ func newEnv(t *testing.T) *env {
 	sm.version(oldVersion, aws.String("{}"), "AWSCURRENT")
 	sm.version(token, nil, "AWSPENDING")
 	logs := &bytes.Buffer{}
-	return &env{
-		root: root, kms: fake, sm: sm, cfg: cfg, logs: logs,
+	e := &env{
+		root: root, kms: fake, sm: sm, cfg: cfg, logs: logs, clock: time.Now(),
 		rotator: &rotation.Rotator{
 			SecretsManager: sm,
 			Config:         cfg,
@@ -81,6 +83,8 @@ func newEnv(t *testing.T) *env {
 			Logger:         slog.New(slog.NewJSONHandler(logs, nil)),
 		},
 	}
+	e.rotator.Now = func() time.Time { return e.clock }
+	return e
 }
 
 func (e *env) step(step string) error {
@@ -268,7 +272,7 @@ func TestTestSecretRejects(t *testing.T) {
 			p := profileOf(e)
 			p.Validity = 10 * 24 * time.Hour
 			return encode(t, issue(t, e.root, p))
-		}, "is before"},
+		}, "issued at"},
 		{"other path length", func(t *testing.T, e *env) string {
 			p := profileOf(e)
 			p.MaxPathLen = 1
@@ -277,16 +281,17 @@ func TestTestSecretRejects(t *testing.T) {
 		{"unknown format", func(t *testing.T, e *env) string {
 			return strings.Replace(encode(t, issue(t, e.root, profileOf(e))), "intermediate-ca/v1", "intermediate-ca/v0", 1)
 		}, "unknown secret format"},
-		{"no value", func(*testing.T, *env) string { return "" }, "read the pending version"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
-			if v := tc.pending(t, e); v != "" {
-				e.sm.version(token, aws.String(v), "AWSPENDING")
-			}
+			e.sm.version(token, aws.String(tc.pending(t, e)), "AWSPENDING")
 			err := e.step(rotation.StepTest)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("testSecret = %v, want an error with %q", err, tc.wantErr)
+			}
+			// Every rejection of a stored value says how to get unstuck.
+			if !strings.Contains(err.Error(), "--remove-from-version-id "+token) {
+				t.Fatalf("testSecret = %v, want the recovery command", err)
 			}
 		})
 	}
@@ -344,5 +349,139 @@ func TestFinishSecret(t *testing.T) {
 	}
 	if len(e.sm.updates) != 1 {
 		t.Fatalf("updates %d, want 1", len(e.sm.updates))
+	}
+}
+
+// A rotation that failed after createSecret is retried, later, with the
+// same AWSPENDING version: it passes testSecret while enough of it is left,
+// and fails with the way out once too little is.
+func TestRetryLater(t *testing.T) {
+	day := 24 * time.Hour
+	for _, tc := range []struct {
+		name  string
+		after time.Duration
+		ok    bool
+	}{
+		{"a day later", day, true},
+		{"a week later", 7 * day, true},
+		{"most of the validity later", 80 * day, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			if err := e.step(rotation.StepCreate); err != nil {
+				t.Fatal(err)
+			}
+			e.clock = e.clock.Add(tc.after)
+			// The retry: createSecret reuses the value, then testSecret.
+			if err := e.step(rotation.StepCreate); err != nil {
+				t.Fatal(err)
+			}
+			err := e.step(rotation.StepTest)
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("testSecret: %v", err)
+				}
+				if err := e.step(rotation.StepFinish); err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "too little validity left") ||
+				!strings.Contains(err.Error(), "update-secret-version-stage") {
+				t.Fatalf("testSecret = %v, want too little validity left and the recovery command", err)
+			}
+			if e.kms.Signs() != 1 {
+				t.Fatalf("KMS Sign calls %d, want 1", e.kms.Signs())
+			}
+		})
+	}
+}
+
+// A path length the root has no room for is caught before it is stored,
+// and in a stored pending version. Config validation normally prevents it;
+// the configuration is changed behind its back here.
+func TestPathLengthBeyondRoot(t *testing.T) {
+	e := newEnv(t)
+	tooLong := 2 // the root's path length is 2: at most 1 under it
+	_, sc, _ := e.cfg.Lookup(secretARN)
+	sc.MaxPathLen = &tooLong
+	err := e.step(rotation.StepCreate)
+	if err == nil || !strings.Contains(err.Error(), "path length") {
+		t.Fatalf("createSecret = %v, want a path length error", err)
+	}
+	if e.sm.puts != 0 {
+		t.Fatal("an intermediate with a path length too long was stored")
+	}
+	e.sm.version(token, aws.String(encode(t, issue(t, e.root, profileOf(e)))), "AWSPENDING")
+	if err := e.step(rotation.StepTest); err == nil || !strings.Contains(err.Error(), "path length") {
+		t.Fatalf("testSecret = %v, want a path length error", err)
+	}
+}
+
+// Two invocations for the same token: the one that loses the
+// PutSecretValue race finds the winner's version and succeeds.
+func TestCreateSecretConcurrent(t *testing.T) {
+	e := newEnv(t)
+	winner := encode(t, issue(t, e.root, profileOf(e)))
+	e.sm.beforePut = func() {
+		e.sm.mu.Lock()
+		defer e.sm.mu.Unlock()
+		e.sm.values[token] = aws.String(winner)
+	}
+	if err := e.step(rotation.StepCreate); err != nil {
+		t.Fatal(err)
+	}
+	if e.sm.value(token) != winner {
+		t.Fatal("the winner's value was replaced")
+	}
+	if strings.Contains(e.logs.String(), "issued intermediate certificate") {
+		t.Fatal("the losing certificate was logged as issued")
+	}
+}
+
+func TestCreateSecretRotationToken(t *testing.T) {
+	for _, rt := range []string{"", "opaque-rotation-token"} {
+		e := newEnv(t)
+		ev := rotation.Event{SecretID: secretARN, ClientRequestToken: token, Step: rotation.StepCreate, RotationToken: rt}
+		if err := e.rotator.Handle(context.Background(), ev); err != nil {
+			t.Fatal(err)
+		}
+		got := e.sm.lastPut.RotationToken
+		if (rt == "" && got != nil) || (rt != "" && aws.ToString(got) != rt) {
+			t.Fatalf("RotationToken %v, want %q", got, rt)
+		}
+		if rt != "" && strings.Contains(e.logs.String(), rt) {
+			t.Fatal("the rotation token was logged")
+		}
+	}
+}
+
+// Rotation configured without rotating immediately: Secrets Manager runs
+// testSecret alone, with no value to test. That succeeds; a value is always
+// tested.
+func TestConfigurationTest(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{"pending version without a value", token},
+		{"token not a version", "99999999-0000-0000-0000-000000000000"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			ev := rotation.Event{SecretID: secretARN, ClientRequestToken: tc.token, Step: rotation.StepTest}
+			if err := e.rotator.Handle(context.Background(), ev); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(e.logs.String(), "configuration test") {
+				t.Fatal("not logged as a configuration test")
+			}
+			if e.kms.Signs() != 0 || e.sm.puts != 0 || len(e.sm.updates) != 0 {
+				t.Fatal("a configuration test changed something")
+			}
+		})
+	}
+	e := newEnv(t)
+	e.sm.version(token, aws.String("{}"), "AWSPENDING")
+	if err := e.step(rotation.StepTest); err == nil {
+		t.Fatal("a pending version with a value was not tested")
 	}
 }
