@@ -10,7 +10,7 @@ secret in the [secret format v1](docs/secret-format.md). Whatever consumes the
 intermediate reads the secret's `AWSCURRENT` version; the rotator knows
 nothing about it.
 
-The Lambda (`cmd/rotator`) runs on the `provided.al2023` custom runtime, arm64
+The Lambda (`main.go`, the root package) runs on the `provided.al2023` custom runtime, arm64
 or x86_64.
 
 ## Rotation flow
@@ -354,13 +354,13 @@ Bazel is the only build; the version is pinned in `.bazelversion` and Bazelisk
 picks it up.
 
 ```bash
-bazel build //cmd/rotator:zip_linux_arm64 //cmd/rotator:zip_linux_amd64   # the archives
-bazel build //cmd/rotator                                                 # the binary, for this host
+bazel build //:zip_linux_arm64 //:zip_linux_amd64   # the archives
+bazel build //:rotator                                                 # the binary, for this host
 bazel test //...
-bazel run //cmd/rotator -- --version
+bazel run //:rotator -- --version
 ```
 
-The archives are in `bazel-bin/cmd/rotator/`. The tests use in-process fakes
+The archives are in `bazel-bin/`. The tests use in-process fakes
 of KMS and Secrets Manager backed by real keys; they make no network calls.
 See [AGENTS.md](AGENTS.md) for the layout and the rest of the commands.
 

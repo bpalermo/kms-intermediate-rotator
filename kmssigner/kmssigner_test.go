@@ -18,7 +18,7 @@ import (
 
 	"github.com/bpalermo/kms-intermediate-rotator/internal/kmsfake"
 	"github.com/bpalermo/kms-intermediate-rotator/internal/testca"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/kmssigner"
+	"github.com/bpalermo/kms-intermediate-rotator/kmssigner"
 )
 
 const keyID = "alias/example-root"

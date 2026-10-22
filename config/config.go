@@ -17,8 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/intermediate"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/secretformat"
+	"github.com/bpalermo/kms-intermediate-rotator/intermediate"
+	"github.com/bpalermo/kms-intermediate-rotator/secretformat"
 )
 
 // The environment variables the configuration comes from.

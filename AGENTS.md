@@ -16,8 +16,8 @@ contract with readers in other repositories. Its "Format" section changes only
 together with theirs.
 
 Nothing reaches AWS in a test: KMS and Secrets Manager are in-process fakes
-backed by real keys (`internal/kmsfake`, the fake in `pkg/rotation`'s tests),
-SSM is a fake in `pkg/config`'s tests. Keep it that way.
+backed by real keys (`internal/kmsfake`, the fake in `rotation`'s tests),
+SSM is a fake in `config`'s tests. Keep it that way.
 
 ## Build and test
 
@@ -27,7 +27,7 @@ bazel run //:gazelle            # after adding, removing or renaming any .go fil
 bazel run //:format             # format Starlark, Go and shell; CI runs //:format.check
 bazel mod tidy                  # after changing go.mod or a bazel_dep
 bazel build --config=ci //...   # what CI builds: lockfile must be current, shellcheck and gocognit on
-bazel run //cmd/rotator -- --version
+bazel run //:rotator -- --version
 ```
 
 Bazel is the only build. Never use the host `go` tool, and do not "fix" go.mod
@@ -55,18 +55,18 @@ diff.
 
 ## Layout
 
-- `cmd/rotator`: the Lambda: start-up (configuration, the KMS public-key
+- `main.go` (root package): the Lambda: start-up (configuration, the KMS public-key
   check) and the aws-lambda-go handler. The binary is named `bootstrap`
   (`basename`), as the `provided.al2023` runtime requires, and is built with
   the `lambda.norpc` tag.
-- `pkg/config`: loads (`ROTATOR_CONFIG` or `ROTATOR_CONFIG_PARAMETER`) and
+- `config`: loads (`ROTATOR_CONFIG` or `ROTATOR_CONFIG_PARAMETER`) and
   validates the configuration.
-- `pkg/kmssigner`: a `crypto.Signer` over KMS `Sign` (`DIGEST`), refusing a
+- `kmssigner`: a `crypto.Signer` over KMS `Sign` (`DIGEST`), refusing a
   key whose public key is not the root certificate's.
-- `pkg/intermediate`: the intermediate's template, issuance and the check of
+- `intermediate`: the intermediate's template, issuance and the check of
   an issued certificate against its profile.
-- `pkg/secretformat`: encode, decode and verify the secret format v1.
-- `pkg/rotation`: the four rotation steps over narrow Secrets Manager
+- `secretformat`: encode, decode and verify the secret format v1.
+- `rotation`: the four rotation steps over narrow Secrets Manager
   interfaces.
 - `internal/version`: the build version, stamped from the git state.
 - `internal/kmsfake`, `internal/testca`: test-only helpers (`testonly`).
@@ -76,18 +76,18 @@ diff.
 
 ## Release archives
 
-`//cmd/rotator:zip_linux_arm64` and `//cmd/rotator:zip_linux_amd64` are
+`//:zip_linux_arm64` and `//:zip_linux_amd64` are
 `pkg_zip`s of the binary cross-compiled for that platform (`go_cross_binary`,
 pure Go, CGO off), holding one executable file `bootstrap`, mode 0755, with
 fixed timestamps so the same inputs give the same bytes. The binary is stamped
 with the release (`--version`). There is no container image.
 
-`//cmd/rotator:release_zips_test` holds the contents of both archives
+`//:release_zips_test` holds the contents of both archives
 (one executable `bootstrap`, ELF of the right machine, static).
 
 The archives' names in Bazel carry no version; `.github/workflows/release.yml`
 copies them to `kms-intermediate-rotator_<version>_linux_<arch>.zip`. Keep its
-`PLATFORMS` equal to the list in `cmd/rotator/BUILD.bazel`.
+`PLATFORMS` equal to the list in the root `BUILD.bazel`.
 
 ## Versions and releasing
 

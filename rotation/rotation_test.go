@@ -14,13 +14,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
+	"github.com/bpalermo/kms-intermediate-rotator/config"
+	"github.com/bpalermo/kms-intermediate-rotator/intermediate"
 	"github.com/bpalermo/kms-intermediate-rotator/internal/kmsfake"
 	"github.com/bpalermo/kms-intermediate-rotator/internal/testca"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/config"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/intermediate"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/kmssigner"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/rotation"
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/secretformat"
+	"github.com/bpalermo/kms-intermediate-rotator/kmssigner"
+	"github.com/bpalermo/kms-intermediate-rotator/rotation"
+	"github.com/bpalermo/kms-intermediate-rotator/secretformat"
 )
 
 const (

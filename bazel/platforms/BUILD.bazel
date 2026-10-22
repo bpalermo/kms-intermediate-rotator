@@ -1,4 +1,4 @@
-# The platforms the Lambda is built for (//cmd/rotator). The binary is pure
+# The platforms the Lambda is built for (//:rotator). The binary is pure
 # Go and cross-compiles for either on any host.
 package(default_visibility = ["//visibility:public"])
 

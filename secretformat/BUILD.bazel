@@ -3,7 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "secretformat",
     srcs = ["secretformat.go"],
-    importpath = "github.com/bpalermo/kms-intermediate-rotator/pkg/secretformat",
+    importpath = "github.com/bpalermo/kms-intermediate-rotator/secretformat",
     visibility = ["//visibility:public"],
 )
 
@@ -12,7 +12,7 @@ go_test(
     srcs = ["secretformat_test.go"],
     deps = [
         ":secretformat",
+        "//intermediate",
         "//internal/testca",
-        "//pkg/intermediate",
     ],
 )

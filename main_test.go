@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bpalermo/kms-intermediate-rotator/pkg/rotation"
+	"github.com/bpalermo/kms-intermediate-rotator/rotation"
 )
 
 func noStart(t *testing.T) func(func(context.Context, rotation.Event) error) {
