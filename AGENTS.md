@@ -11,8 +11,13 @@ repository is a public one: no account IDs, ARNs, key IDs, personal domains or
 host names anywhere (code, tests, examples, docs, workflows). Examples use
 `example.org`. No secrets.
 
-The rotation code is not written yet; `cmd/rotator/main.go` is a stub that
-prints its version.
+`docs/secret-format.md` is the format of the secret (`intermediate-ca/v1`): a
+contract with readers in other repositories. Its "Format" section changes only
+together with theirs.
+
+Nothing reaches AWS in a test: KMS and Secrets Manager are in-process fakes
+backed by real keys (`internal/kmsfake`, the fake in `pkg/rotation`'s tests),
+SSM is a fake in `pkg/config`'s tests. Keep it that way.
 
 ## Build and test
 
@@ -50,10 +55,21 @@ diff.
 
 ## Layout
 
-- `cmd/rotator`: the Lambda. The binary is named `bootstrap` (`basename`), as
-  the `provided.al2023` runtime requires.
+- `cmd/rotator`: the Lambda: start-up (configuration, the KMS public-key
+  check) and the aws-lambda-go handler. The binary is named `bootstrap`
+  (`basename`), as the `provided.al2023` runtime requires, and is built with
+  the `lambda.norpc` tag.
+- `pkg/config`: loads (`ROTATOR_CONFIG` or `ROTATOR_CONFIG_PARAMETER`) and
+  validates the configuration.
+- `pkg/kmssigner`: a `crypto.Signer` over KMS `Sign` (`DIGEST`), refusing a
+  key whose public key is not the root certificate's.
+- `pkg/intermediate`: the intermediate's template, issuance and the check of
+  an issued certificate against its profile.
+- `pkg/secretformat`: encode, decode and verify the secret format v1.
+- `pkg/rotation`: the four rotation steps over narrow Secrets Manager
+  interfaces.
 - `internal/version`: the build version, stamped from the git state.
-- `pkg/...`: libraries (intermediate, kmssigner, rotation) arrive with the code.
+- `internal/kmsfake`, `internal/testca`: test-only helpers (`testonly`).
 - `bazel/`: build rules and CI scripts: `workspace_status.sh` (stamping),
   `ci-impacted-targets.sh` (bazel-diff), `nogo/`, `lint/`, `format/`,
   `platforms/`, `cosign/`.

@@ -42,4 +42,4 @@ go_sdk.nogo(nogo = "//:nogo")
 
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//:go.mod")
-use_repo(go_deps, "co_honnef_go_tools", "com_github_uudashr_gocognit")
+use_repo(go_deps, "co_honnef_go_tools", "com_github_aws_aws_lambda_go", "com_github_aws_aws_sdk_go_v2", "com_github_aws_aws_sdk_go_v2_config", "com_github_aws_aws_sdk_go_v2_service_kms", "com_github_aws_aws_sdk_go_v2_service_secretsmanager", "com_github_aws_aws_sdk_go_v2_service_ssm", "com_github_uudashr_gocognit")

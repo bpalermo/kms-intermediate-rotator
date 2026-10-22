@@ -1,0 +1,10 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "testca",
+    # A test double: only tests may depend on it.
+    testonly = True,
+    srcs = ["testca.go"],
+    importpath = "github.com/bpalermo/kms-intermediate-rotator/internal/testca",
+    visibility = ["//:__subpackages__"],
+)

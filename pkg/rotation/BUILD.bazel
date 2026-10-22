@@ -1,0 +1,37 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "rotation",
+    srcs = ["rotation.go"],
+    importpath = "github.com/bpalermo/kms-intermediate-rotator/pkg/rotation",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/config",
+        "//pkg/intermediate",
+        "//pkg/kmssigner",
+        "//pkg/secretformat",
+        "@com_github_aws_aws_sdk_go_v2//aws",
+        "@com_github_aws_aws_sdk_go_v2_service_secretsmanager//:secretsmanager",
+        "@com_github_aws_aws_sdk_go_v2_service_secretsmanager//types",
+    ],
+)
+
+go_test(
+    name = "rotation_test",
+    srcs = [
+        "rotation_test.go",
+        "smfake_test.go",
+    ],
+    deps = [
+        ":rotation",
+        "//internal/kmsfake",
+        "//internal/testca",
+        "//pkg/config",
+        "//pkg/intermediate",
+        "//pkg/kmssigner",
+        "//pkg/secretformat",
+        "@com_github_aws_aws_sdk_go_v2//aws",
+        "@com_github_aws_aws_sdk_go_v2_service_secretsmanager//:secretsmanager",
+        "@com_github_aws_aws_sdk_go_v2_service_secretsmanager//types",
+    ],
+)
