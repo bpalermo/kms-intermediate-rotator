@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "intermediate",
+    srcs = [
+        "intermediate.go",
+        "key.go",
+    ],
+    importpath = "github.com/bpalermo/kms-intermediate-rotator/pkg/intermediate",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "intermediate_test",
+    srcs = ["intermediate_test.go"],
+    deps = [
+        ":intermediate",
+        "//internal/testca",
+    ],
+)
